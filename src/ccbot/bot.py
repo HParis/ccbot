@@ -47,6 +47,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -1958,4 +1959,30 @@ def create_bot() -> Application:
         )
     )
 
+    application.add_error_handler(_error_handler)
+
     return application
+
+
+async def _error_handler(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Log errors from the polling loop and handlers.
+
+    Without this handler, python-telegram-bot logs a noisy traceback for every
+    transient network error via ``Application - ERROR - No error handlers are
+    registered``.  More importantly, registering the handler ensures the
+    library's internal ``network_retry_loop`` properly retries on
+    ``NetworkError`` rather than letting unhandled exceptions propagate.
+    """
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.debug("Network error in polling: %s", err)
+    elif isinstance(err, RetryAfter):
+        logger.warning("Rate limited, retry after %ss", err.retry_after)
+    elif isinstance(err, Conflict):
+        logger.error(
+            "Conflict: another bot instance is running with the same token"
+        )
+    else:
+        logger.error("Unhandled error: %s", err, exc_info=err)
