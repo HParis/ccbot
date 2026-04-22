@@ -1156,17 +1156,6 @@ async def _create_and_bind_window(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 
-            # Rename the topic to match the window name
-            resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
-            try:
-                await context.bot.edit_forum_topic(
-                    chat_id=resolved_chat,
-                    message_thread_id=pending_thread_id,
-                    name=created_wname,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to rename topic: {e}")
-
             status = "Resumed" if resume_session_id else "Created"
             await safe_edit(
                 query,
@@ -1196,7 +1185,7 @@ async def _create_and_bind_window(
                     logger.warning("Failed to forward pending text: %s", send_msg)
                     await safe_send(
                         context.bot,
-                        resolved_chat,
+                        session_manager.resolve_chat_id(user.id, pending_thread_id),
                         f"❌ Failed to send pending message: {send_msg}",
                         message_thread_id=pending_thread_id,
                     )
@@ -1606,17 +1595,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user.id, thread_id, selected_wid, window_name=display
         )
 
-        # Rename the topic to match the new tab name.
-        resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
-        try:
-            await context.bot.edit_forum_topic(
-                chat_id=resolved_chat,
-                message_thread_id=thread_id,
-                name=display,
-            )
-        except Exception as e:
-            logger.debug(f"Failed to rename topic: {e}")
-
         # If session_map says Claude isn't here, double-check the tab's
         # foreground command before typing `claude`. iTerm2 reports the
         # job as "node-runtime" when Claude is running; if so, the
@@ -1656,7 +1634,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 logger.warning("Failed to forward pending text: %s", send_msg)
                 await safe_send(
                     context.bot,
-                    resolved_chat,
+                    session_manager.resolve_chat_id(user.id, thread_id),
                     f"❌ Failed to send pending message: {send_msg}",
                     message_thread_id=thread_id,
                 )
