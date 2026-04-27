@@ -279,6 +279,40 @@ class SessionMonitor:
 
         # Scan projects to get available session files
         sessions = await self.scan_projects()
+        scanned_ids = {s.session_id for s in sessions}
+
+        # Also include rebound sessions (--resume): the hook reports a new
+        # session_id but Claude Code keeps writing to the original JSONL.
+        # Two cases:
+        #  1) Tracked state already rebound (file_path points to old JSONL)
+        #  2) Fresh start — no tracked state, need cwd-based JSONL lookup
+        for active_id in active_session_ids:
+            if active_id in scanned_ids:
+                continue  # Already found via scan
+            # Case 1: already tracked (rebound from a previous cycle)
+            tracked = self.state.get_session(active_id)
+            if tracked and tracked.file_path:
+                file_path = Path(tracked.file_path)
+                if file_path.exists():
+                    sessions.append(
+                        SessionInfo(
+                            session_id=active_id,
+                            file_path=file_path,
+                        )
+                    )
+                    continue
+            # Case 2: find the most recently modified JSONL in the project dir
+            cwd = self._get_cwd_for_session(active_id)
+            if not cwd:
+                continue
+            fallback = self._find_latest_jsonl_for_cwd(cwd)
+            if fallback:
+                sessions.append(SessionInfo(session_id=active_id, file_path=fallback))
+                logger.info(
+                    "Session %s has no JSONL; using fallback %s",
+                    active_id,
+                    fallback.name,
+                )
 
         # Only process sessions that are in session_map
         for session_info in sessions:
@@ -304,6 +338,31 @@ class SessionMonitor:
                     self.state.update_session(tracked)
                     self._file_mtimes[session_info.session_id] = current_mtime
                     logger.info(f"Started tracking session: {session_info.session_id}")
+                    continue
+
+                # Detect file path change (e.g. --resume created a new
+                # JSONL that scan_projects now finds by session_id).
+                # Reset offset to EOF to avoid replaying old content.
+                if (
+                    tracked.file_path
+                    and str(session_info.file_path) != tracked.file_path
+                ):
+                    logger.info(
+                        "Session %s file changed: %s -> %s, resetting offset to EOF",
+                        session_info.session_id,
+                        Path(tracked.file_path).name,
+                        session_info.file_path.name,
+                    )
+                    try:
+                        new_size = session_info.file_path.stat().st_size
+                    except OSError:
+                        new_size = 0
+                    tracked.file_path = str(session_info.file_path)
+                    tracked.last_byte_offset = new_size
+                    self.state.update_session(tracked)
+                    self._file_mtimes[session_info.session_id] = (
+                        session_info.file_path.stat().st_mtime if new_size else 0.0
+                    )
                     continue
 
                 # Check mtime + file size to see if file has changed
@@ -372,6 +431,36 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
+    def _get_cwd_for_session(self, session_id: str) -> str:
+        """Look up the cwd for a session_id from the raw session_map file."""
+        try:
+            data = json.loads(config.session_map_file.read_text())
+            prefix = f"{config.tmux_session_name}:"
+            for key, info in data.items():
+                if key.startswith(prefix) and info.get("session_id") == session_id:
+                    return info.get("cwd", "")
+        except (json.JSONDecodeError, OSError):
+            pass
+        return ""
+
+    def _find_latest_jsonl_for_cwd(self, cwd: str) -> Path | None:
+        """Find the most recently modified JSONL in the project dir for *cwd*."""
+        dir_name = str(Path(cwd).resolve()).replace("/", "-")
+        project_dir = self.projects_path / dir_name
+        if not project_dir.is_dir():
+            return None
+        best: Path | None = None
+        best_mtime = 0.0
+        for f in project_dir.glob("*.jsonl"):
+            try:
+                mt = f.stat().st_mtime
+            except OSError:
+                continue
+            if mt > best_mtime:
+                best_mtime = mt
+                best = f
+        return best
+
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_key -> session_id mapping.
 
@@ -422,11 +511,17 @@ class SessionMonitor:
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
         """Detect session_map changes and cleanup replaced/removed sessions.
 
+        When a window's session_id changes (e.g. after ``--resume``), the hook
+        reports a new session_id but Claude Code may keep writing to the
+        **original** JSONL file.  In that case we rebind the tracked session
+        under the new id so monitoring continues uninterrupted.
+
         Returns current session_map for further processing.
         """
         current_map = await self._load_current_session_map()
 
         sessions_to_remove: set[str] = set()
+        sessions_to_rebind: dict[str, str] = {}  # old_id -> new_id
 
         # Check for window session changes (window exists in both, but session_id changed)
         for window_id, old_session_id in self._last_session_map.items():
@@ -438,7 +533,23 @@ class SessionMonitor:
                     old_session_id,
                     new_session_id,
                 )
-                sessions_to_remove.add(old_session_id)
+                # Check if new session has its own JSONL file
+                new_has_file = any(
+                    s.session_id == new_session_id for s in await self.scan_projects()
+                )
+                old_tracked = self.state.get_session(old_session_id)
+                if not new_has_file and old_tracked:
+                    # --resume case: new id has no JSONL, keep monitoring
+                    # old file under the new session_id
+                    sessions_to_rebind[old_session_id] = new_session_id
+                    logger.info(
+                        "Rebinding tracked session %s -> %s (resume, "
+                        "old JSONL still active)",
+                        old_session_id,
+                        new_session_id,
+                    )
+                else:
+                    sessions_to_remove.add(old_session_id)
 
         # Check for deleted windows (window in old map but not in current)
         old_windows = set(self._last_session_map.keys())
@@ -453,6 +564,21 @@ class SessionMonitor:
                 old_session_id,
             )
             sessions_to_remove.add(old_session_id)
+
+        # Perform rebinds (rename tracked session to new id)
+        for old_id, new_id in sessions_to_rebind.items():
+            tracked = self.state.get_session(old_id)
+            if tracked:
+                self.state.remove_session(old_id)
+                tracked.session_id = new_id
+                self.state.update_session(tracked)
+                # Migrate mtime cache
+                mtime = self._file_mtimes.pop(old_id, 0.0)
+                self._file_mtimes[new_id] = mtime
+                # Migrate pending tools
+                pending = self._pending_tools.pop(old_id, None)
+                if pending:
+                    self._pending_tools[new_id] = pending
 
         # Perform cleanup
         if sessions_to_remove:

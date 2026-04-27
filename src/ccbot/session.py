@@ -696,16 +696,16 @@ class SessionManager:
         if session:
             return session
 
-        # File no longer exists, clear state
-        logger.warning(
-            "Session file no longer exists for window_id %s (sid=%s, cwd=%s)",
+        # JSONL file doesn't exist for this session_id.  This is normal
+        # after --resume (hook reports new id, Claude keeps old JSONL).
+        # Log at debug, do NOT clear state — find_users_for_session uses
+        # the session_map directly and doesn't depend on the file.
+        logger.debug(
+            "Session file not found for window_id %s (sid=%s, cwd=%s)",
             window_id,
             state.session_id,
             state.cwd,
         )
-        state.session_id = ""
-        state.cwd = ""
-        self._save_state()
         return None
 
     # --- User window offset management ---
@@ -800,13 +800,33 @@ class SessionManager:
     ) -> list[tuple[int, str, int]]:
         """Find all users whose thread-bound window maps to the given session_id.
 
+        Matches via the session_map (window_id → session_id) rather than
+        validating the JSONL file on disk, because ``--resume`` can change
+        the session_id while Claude keeps writing to the original JSONL.
+
         Returns list of (user_id, window_id, thread_id) tuples.
         """
+        # Build window_id → session_id from session_map
+        window_to_session = self._load_session_map_by_window()
+
         result: list[tuple[int, str, int]] = []
         for user_id, thread_id, window_id in self.iter_thread_bindings():
-            resolved = await self.resolve_session_for_window(window_id)
-            if resolved and resolved.session_id == session_id:
+            if window_to_session.get(window_id) == session_id:
                 result.append((user_id, window_id, thread_id))
+        return result
+
+    def _load_session_map_by_window(self) -> dict[str, str]:
+        """Return {window_id: session_id} from session_map.json."""
+        try:
+            data = json.loads(config.session_map_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        prefix = f"{config.tmux_session_name}:"
+        result: dict[str, str] = {}
+        for key, info in data.items():
+            if key.startswith(prefix):
+                wid = key[len(prefix) :]
+                result[wid] = info.get("session_id", "")
         return result
 
     # --- Tmux helpers ---
