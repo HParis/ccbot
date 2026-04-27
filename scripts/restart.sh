@@ -40,7 +40,7 @@ fi
 
 # Rebuild and install ccbot from source
 echo "Building ccbot from source..."
-if uv tool install "${PROJECT_DIR}" --force 2>&1; then
+if uv tool install "${PROJECT_DIR}" --force --reinstall 2>&1; then
     echo "Build successful."
 else
     echo "Error: build failed"

@@ -123,19 +123,31 @@ async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
     last_topic_check = 0.0
+    consecutive_probe_failures = 0
     while True:
         try:
-            # Periodic topic existence probe
+            # Periodic topic existence probe — backs off on repeated failures
+            # to avoid exhausting the httpx connection pool
             now = time.monotonic()
-            if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
+            backoff = min(
+                TOPIC_CHECK_INTERVAL * (2**consecutive_probe_failures),
+                600.0,  # cap at 10 minutes
+            )
+            if now - last_topic_check >= backoff:
                 last_topic_check = now
+                probe_failed = False
                 for user_id, thread_id, wid in list(
                     session_manager.iter_thread_bindings()
                 ):
                     try:
-                        await bot.unpin_all_forum_topic_messages(
-                            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
-                            message_thread_id=thread_id,
+                        await asyncio.wait_for(
+                            bot.unpin_all_forum_topic_messages(
+                                chat_id=session_manager.resolve_chat_id(
+                                    user_id, thread_id
+                                ),
+                                message_thread_id=thread_id,
+                            ),
+                            timeout=10.0,
                         )
                     except BadRequest as e:
                         if "Topic_id_invalid" in str(e):
@@ -158,12 +170,18 @@ async def status_poll_loop(bot: Bot) -> None:
                                 wid,
                                 e,
                             )
+                            probe_failed = True
                     except Exception as e:
                         logger.debug(
                             "Topic probe error for %s: %s",
                             wid,
                             e,
                         )
+                        probe_failed = True
+                if probe_failed:
+                    consecutive_probe_failures = min(consecutive_probe_failures + 1, 4)
+                else:
+                    consecutive_probe_failures = 0
 
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:

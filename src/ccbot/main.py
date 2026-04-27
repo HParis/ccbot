@@ -43,6 +43,8 @@ def main() -> None:
     logging.getLogger("ccbot").setLevel(logging.DEBUG)
     # AIORateLimiter (max_retries=5) handles retries itself; keep INFO for visibility
     logging.getLogger("telegram.ext.AIORateLimiter").setLevel(logging.INFO)
+    # Surface polling retry-loop failures for debugging stuck-updater issues
+    logging.getLogger("telegram.ext._utils.networkloop").setLevel(logging.DEBUG)
     logger = logging.getLogger(__name__)
 
     from .tmux_manager import tmux_manager
@@ -58,7 +60,10 @@ def main() -> None:
     from .bot import create_bot
 
     application = create_bot()
-    application.run_polling(allowed_updates=["message", "callback_query"])
+    application.run_polling(
+        allowed_updates=["message", "callback_query"],
+        timeout=3,  # Telegram long-poll wait (default 10s → 3s for faster recovery)
+    )
 
 
 if __name__ == "__main__":
