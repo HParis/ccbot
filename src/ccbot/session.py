@@ -10,9 +10,9 @@ Responsibilities:
   - Resolve window IDs to ClaudeSession objects (JSONL file reading).
   - Track per-user read offsets for unread-message detection.
   - Manage thread↔window bindings for Telegram topic routing.
-  - Send keystrokes to tmux windows and retrieve message history.
+  - Send keystrokes to iTerm2 tabs and retrieve message history.
   - Maintain window_id→display name mapping for UI display.
-  - Re-resolve stale window IDs on startup (tmux server restart recovery).
+  - Re-resolve stale window IDs on startup (iTerm2 restart recovery).
 
 Key class: SessionManager (singleton instantiated as `session_manager`).
 Key methods for thread binding access:
@@ -33,16 +33,26 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .tmux_manager import tmux_manager
+from .iterm2_manager import iterm2_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
+# Match iTerm2 session UUIDs (case-insensitive: iTerm2 emits them in upper).
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+# session_map.json key prefix for iTerm2 backend entries.  Legacy
+# entries keyed by ``ccbot:`` (tmux era) are filtered out at read time.
+_SESSION_MAP_PREFIX = "iterm:"
+
 
 @dataclass
 class WindowState:
-    """Persistent state for a tmux window.
+    """Persistent state for one iTerm2 tab (one Claude Code session).
 
     Attributes:
         session_id: Associated Claude session ID (empty if not yet detected)
@@ -86,8 +96,9 @@ class ClaudeSession:
 class SessionManager:
     """Manages session state for Claude Code.
 
-    All internal keys use window_id (e.g. '@0', '@12') for uniqueness.
-    Display names (window_name) are stored separately for UI presentation.
+    All internal keys use ``window_id`` (an iTerm2 session UUID) for
+    uniqueness.  Display names (window_name) are stored separately for
+    UI presentation.
 
     window_states: window_id -> WindowState (session_id, cwd, window_name)
     user_window_offsets: user_id -> {window_id -> byte_offset}
@@ -131,8 +142,19 @@ class SessionManager:
         logger.debug("State saved to %s", config.state_file)
 
     def _is_window_id(self, key: str) -> bool:
-        """Check if a key looks like a tmux window ID (e.g. '@0', '@12')."""
-        return key.startswith("@") and len(key) > 1 and key[1:].isdigit()
+        """Check if a key looks like a window ID we recognise.
+
+        Accepts two formats:
+          - iTerm2 session UUID — current format.
+          - tmux window ID like ``@0`` / ``@12`` — legacy.  Returning
+            True here lets ``resolve_stale_ids`` re-key these via
+            display-name lookup against live iTerm2 sessions on
+            startup; otherwise the binding would be dropped as an
+            unrecognised old-format key.
+        """
+        if key.startswith("@") and len(key) > 1 and key[1:].isdigit():
+            return True
+        return bool(_UUID_RE.match(key))
 
     def _load_state(self) -> None:
         """Load state synchronously during initialization.
@@ -192,7 +214,7 @@ class SessionManager:
                 pass
 
     async def resolve_stale_ids(self) -> None:
-        """Re-resolve persisted window IDs against live tmux windows.
+        """Re-resolve persisted window IDs against live iTerm2 tabs.
 
         Called on startup. Handles two cases:
         1. Old-format migration: window_name keys → window_id keys
@@ -200,12 +222,19 @@ class SessionManager:
 
         Builds {window_name: window_id} from live windows, then remaps or drops entries.
         """
-        windows = await tmux_manager.list_windows()
+        windows = await iterm2_manager.list_windows()
         live_by_name: dict[str, str] = {}  # window_name -> window_id
         live_ids: set[str] = set()
         for w in windows:
             live_by_name[w.window_name] = w.window_id
             live_ids.add(w.window_id)
+
+        # Snapshot the display-name map BEFORE any of the migration
+        # passes mutate it.  The window_states pass below removes
+        # entries for old IDs as it re-keys them, but the
+        # thread_bindings and offsets passes still need to look up
+        # the display name for those same old IDs.
+        display_snapshot = dict(self.window_display_names)
 
         changed = False
 
@@ -260,7 +289,7 @@ class SessionManager:
                     if val in live_ids:
                         new_bindings[tid] = val
                     else:
-                        display = self.window_display_names.get(val, val)
+                        display = display_snapshot.get(val, val)
                         new_id = live_by_name.get(display)
                         if new_id:
                             logger.info(
@@ -311,7 +340,7 @@ class SessionManager:
                     if key in live_ids:
                         new_offsets[key] = offset
                     else:
-                        display = self.window_display_names.get(key, key)
+                        display = display_snapshot.get(key, key)
                         new_id = live_by_name.get(display)
                         if new_id:
                             new_offsets[new_id] = offset
@@ -346,7 +375,7 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
+        prefix = _SESSION_MAP_PREFIX
         old_keys = [
             key
             for key in session_map
@@ -363,11 +392,11 @@ class SessionManager:
         )
 
     async def _cleanup_stale_session_map_entries(self, live_ids: set[str]) -> None:
-        """Remove entries for tmux windows that no longer exist.
+        """Remove entries for iTerm2 tabs that no longer exist.
 
         When windows are closed externally (outside ccbot), session_map.json
         retains orphan references. This cleanup removes entries whose window_id
-        is not in the current set of live tmux windows.
+        is not in the current set of live iTerm2 tabs.
         """
         if not config.session_map_file.exists():
             return
@@ -378,7 +407,7 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
+        prefix = _SESSION_MAP_PREFIX
         stale_keys = [
             key
             for key in session_map
@@ -395,7 +424,7 @@ class SessionManager:
 
         atomic_write_json(config.session_map_file, session_map)
         logger.info(
-            "Cleaned up %d stale session_map entries (windows no longer in tmux)",
+            "Cleaned up %d stale session_map entries (sessions no longer in iTerm2)",
             len(stale_keys),
         )
 
@@ -472,7 +501,7 @@ class SessionManager:
             window_id,
             timeout,
         )
-        key = f"{config.tmux_session_name}:{window_id}"
+        key = f"{_SESSION_MAP_PREFIX}{window_id}"
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -499,8 +528,8 @@ class SessionManager:
     async def load_session_map(self) -> None:
         """Read session_map.json and update window_states with new session associations.
 
-        Keys in session_map are formatted as "tmux_session:window_id" (e.g. "ccbot:@12").
-        Only entries matching our tmux_session_name are processed.
+        Keys in session_map are formatted as ``iterm:<UUID>``.
+        Only entries with the iTerm2 prefix are processed; legacy ``ccbot:`` keys are silently ignored.
         Also cleans up window_states entries not in current session_map.
         Updates window_display_names from the "window_name" field in values.
         """
@@ -513,12 +542,12 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
+        prefix = _SESSION_MAP_PREFIX
         valid_wids: set[str] = set()
         changed = False
 
         for key, info in session_map.items():
-            # Only process entries for our tmux session
+            # Only process entries for our iTerm2 session
             if not key.startswith(prefix):
                 continue
             window_id = key[len(prefix) :]
@@ -682,7 +711,7 @@ class SessionManager:
     # --- Window → Session resolution ---
 
     async def resolve_session_for_window(self, window_id: str) -> ClaudeSession | None:
-        """Resolve a tmux window to the best matching Claude session.
+        """Resolve a iTerm2 tab to the best matching Claude session.
 
         Uses persisted session_id + cwd to construct file path directly.
         Returns None if no session is associated with this window.
@@ -724,12 +753,12 @@ class SessionManager:
     def bind_thread(
         self, user_id: int, thread_id: int, window_id: str, window_name: str = ""
     ) -> None:
-        """Bind a Telegram topic thread to a tmux window.
+        """Bind a Telegram topic thread to a iTerm2 tab.
 
         Args:
             user_id: Telegram user ID
             thread_id: Telegram topic thread ID
-            window_id: Tmux window ID (e.g. '@0')
+            window_id: iTerm2 session UUID
             window_name: Display name for the window (optional)
         """
         if user_id not in self.thread_bindings:
@@ -776,7 +805,7 @@ class SessionManager:
         user_id: int,
         thread_id: int | None,
     ) -> str | None:
-        """Resolve the tmux window_id for a user's thread.
+        """Resolve the iTerm2 tab_id for a user's thread.
 
         Returns None if thread_id is None or the thread is not bound.
         """
@@ -821,7 +850,7 @@ class SessionManager:
             data = json.loads(config.session_map_file.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
-        prefix = f"{config.tmux_session_name}:"
+        prefix = _SESSION_MAP_PREFIX
         result: dict[str, str] = {}
         for key, info in data.items():
             if key.startswith(prefix):
@@ -832,7 +861,7 @@ class SessionManager:
     # --- Tmux helpers ---
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
-        """Send text to a tmux window by ID."""
+        """Send text to a iTerm2 tab by ID."""
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",
@@ -840,10 +869,10 @@ class SessionManager:
             display,
             len(text),
         )
-        window = await tmux_manager.find_window_by_id(window_id)
+        window = await iterm2_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
-        success = await tmux_manager.send_keys(window.window_id, text)
+        success = await iterm2_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"

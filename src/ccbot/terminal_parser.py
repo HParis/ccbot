@@ -1,6 +1,6 @@
 """Terminal output parser — detects Claude Code UI elements in pane text.
 
-Parses captured tmux pane content to detect:
+Parses captured iTerm2 pane content to detect:
   - Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt,
     RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
     delimiters.
@@ -264,7 +264,7 @@ def strip_pane_chrome(lines: list[str]) -> list[str]:
 
 
 def extract_bash_output(pane_text: str, command: str) -> str | None:
-    """Extract ``!`` command output from a captured tmux pane.
+    """Extract ``!`` command output from a captured iTerm2 pane.
 
     Searches from the bottom for the ``! <command>`` echo line, then
     returns that line and everything below it (including the ``⎿`` output).

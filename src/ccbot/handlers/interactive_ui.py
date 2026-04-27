@@ -20,7 +20,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
-from ..tmux_manager import tmux_manager
+from ..iterm2_manager import iterm2_manager
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -154,12 +154,12 @@ async def handle_interactive_ui(
     """
     ikey = (user_id, thread_id or 0)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-    w = await tmux_manager.find_window_by_id(window_id)
+    w = await iterm2_manager.find_window_by_id(window_id)
     if not w:
         return False
 
     # Capture plain text (no ANSI colors)
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await iterm2_manager.capture_pane(w.window_id)
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False

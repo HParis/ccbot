@@ -22,7 +22,7 @@ import aiofiles
 
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
-from .tmux_manager import tmux_manager
+from .iterm2_manager import iterm2_manager
 from .transcript_parser import TranscriptParser
 from .utils import read_cwd_from_jsonl
 
@@ -91,9 +91,9 @@ class SessionMonitor:
         self._message_callback = callback
 
     async def _get_active_cwds(self) -> set[str]:
-        """Get normalized cwds of all active tmux windows."""
+        """Get normalized cwds of all active iTerm2 tabs."""
         cwds = set()
-        windows = await tmux_manager.list_windows()
+        windows = await iterm2_manager.list_windows()
         for w in windows:
             try:
                 cwds.add(str(Path(w.cwd).resolve()))
@@ -102,7 +102,7 @@ class SessionMonitor:
         return cwds
 
     async def scan_projects(self) -> list[SessionInfo]:
-        """Scan projects that have active tmux windows."""
+        """Scan projects that have active iTerm2 tabs."""
         active_cwds = await self._get_active_cwds()
         if not active_cwds:
             return []
@@ -435,9 +435,8 @@ class SessionMonitor:
         """Look up the cwd for a session_id from the raw session_map file."""
         try:
             data = json.loads(config.session_map_file.read_text())
-            prefix = f"{config.tmux_session_name}:"
             for key, info in data.items():
-                if key.startswith(prefix) and info.get("session_id") == session_id:
+                if key.startswith("iterm:") and info.get("session_id") == session_id:
                     return info.get("cwd", "")
         except (json.JSONDecodeError, OSError):
             pass
@@ -462,13 +461,11 @@ class SessionMonitor:
         return best
 
     async def _load_current_session_map(self) -> dict[str, str]:
-        """Load current session_map and return window_key -> session_id mapping.
+        """Load current session_map and return window_id -> session_id mapping.
 
-        Keys in session_map are formatted as "tmux_session:window_id"
-        (e.g. "ccbot:@12"). Old-format keys ("ccbot:window_name") are also
-        accepted so that sessions running before a code upgrade continue
-        to be monitored until the hook re-fires with new format.
-        Only entries matching our tmux_session_name are processed.
+        Keys in session_map are formatted as ``iterm:<UUID>``. Legacy
+        ``ccbot:`` keys (tmux era) are silently ignored — they will be
+        overwritten on next SessionStart hook fire.
         """
         window_to_session: dict[str, str] = {}
         if config.session_map_file.exists():
@@ -476,9 +473,8 @@ class SessionMonitor:
                 async with aiofiles.open(config.session_map_file, "r") as f:
                     content = await f.read()
                 session_map = json.loads(content)
-                prefix = f"{config.tmux_session_name}:"
+                prefix = "iterm:"
                 for key, info in session_map.items():
-                    # Only process entries for our tmux session
                     if not key.startswith(prefix):
                         continue
                     window_key = key[len(prefix) :]

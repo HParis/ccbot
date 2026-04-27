@@ -1,7 +1,7 @@
 """Directory browser and window picker UI for session creation.
 
 Provides UIs in Telegram for:
-  - Window picker: list unbound tmux windows for quick binding
+  - Window picker: list unbound iTerm2 tabs for quick binding
   - Directory browser: navigate directory hierarchies to create new sessions
 
 Key components:
@@ -77,7 +77,7 @@ def clear_session_picker_state(user_data: dict | None) -> None:
 def build_window_picker(
     windows: list[tuple[str, str, str]],
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
-    """Build window picker UI for unbound tmux windows.
+    """Build window picker UI for unbound iTerm2 tabs.
 
     Args:
         windows: List of (window_id, window_name, cwd) tuples.

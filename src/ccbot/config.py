@@ -1,6 +1,6 @@
 """Application configuration — reads env vars and exposes a singleton.
 
-Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, tmux/Claude paths, and
+Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, iTerm2/Claude paths, and
 monitoring intervals from environment variables (with .env support).
 .env loading priority: local .env (cwd) > $CCBOT_DIR/.env (default ~/.ccbot).
 The module-level `config` instance is imported by nearly every other module.
@@ -18,7 +18,8 @@ from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
 
-# Env vars that must not leak to child processes (e.g. Claude Code via tmux)
+# Env vars that must not leak to child processes (e.g. Claude Code in iTerm2).
+# Scrubbed from os.environ during Config init.
 SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
 
 
@@ -56,11 +57,6 @@ class Config:
                 f"ALLOWED_USERS contains non-numeric value: {e}. "
                 "Expected comma-separated Telegram user IDs."
             ) from e
-
-        # Tmux session name and window naming (legacy — read sites are
-        # being migrated to iTerm2 in this branch; remove in Unit 6)
-        self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
-        self.tmux_main_window_name = "__main__"
 
         # iTerm2 profile used for ccbot-owned tabs. The profile should
         # have its Title field set to "Session Name" so the bot's
@@ -121,11 +117,11 @@ class Config:
 
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
-            "tmux_session=%s, claude_projects_path=%s",
+            "iterm2_profile=%s, claude_projects_path=%s",
             self.config_dir,
             self.telegram_bot_token[:8],
             len(self.allowed_users),
-            self.tmux_session_name,
+            self.iterm2_profile_name,
             self.claude_projects_path,
         )
 

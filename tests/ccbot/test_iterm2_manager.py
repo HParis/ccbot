@@ -53,39 +53,8 @@ def test_public_methods_present(method_name: str) -> None:
     assert inspect.iscoroutinefunction(method), f"{method_name} must be async"
 
 
-def test_signature_parity_with_tmux_manager() -> None:
-    """Method signatures match the previous TmuxManager 1:1.
-
-    During the migration window tmux_manager.py still exists; once
-    Unit 6 deletes it this test is removed in the same change-set.
-    """
-    try:
-        from ccbot.tmux_manager import TmuxManager  # type: ignore[attr-defined]
-    except ImportError:
-        pytest.skip("tmux_manager already removed")
-
-    for name in (
-        "list_windows",
-        "find_window_by_name",
-        "find_window_by_id",
-        "capture_pane",
-        "send_keys",
-        "rename_window",
-        "kill_window",
-        "create_window",
-    ):
-        old = inspect.signature(getattr(TmuxManager, name))
-        new = inspect.signature(getattr(ITerm2Manager, name))
-        # Compare parameter names and kinds; ignore annotations because
-        # the new module uses ITermWindow vs TmuxWindow returns.
-        old_params = [(p.name, p.kind, p.default) for p in old.parameters.values()]
-        new_params = [(p.name, p.kind, p.default) for p in new.parameters.values()]
-        assert old_params == new_params, (
-            f"{name}: signature drift — old={old_params} new={new_params}"
-        )
-
-
-# All methods are now implemented; no remaining NotImplementedError stubs.
+# tmux_manager.py is gone — the signature-parity test that lived here
+# during the migration was retired in the same change-set.
 
 
 # ----------------------------------------------------------------------

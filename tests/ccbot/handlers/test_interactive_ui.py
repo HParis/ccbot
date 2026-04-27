@@ -53,11 +53,11 @@ class TestHandleInteractiveUI:
         mock_window.window_id = window_id
 
         with (
-            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.interactive_ui.iterm2_manager") as mock_iterm,
             patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
         ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value=sample_pane_settings)
             mock_sm.resolve_chat_id.return_value = 100
 
             result = await handle_interactive_ui(
@@ -79,11 +79,11 @@ class TestHandleInteractiveUI:
         mock_window.window_id = window_id
 
         with (
-            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.interactive_ui.iterm2_manager") as mock_iterm,
             patch("ccbot.handlers.interactive_ui.session_manager"),
         ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.capture_pane = AsyncMock(return_value="$ echo hello\nhello\n$\n")
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value="$ echo hello\nhello\n$\n")
 
             result = await handle_interactive_ui(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42

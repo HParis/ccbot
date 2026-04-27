@@ -30,7 +30,7 @@ from telegram.error import RetryAfter
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
-from ..tmux_manager import tmux_manager
+from ..iterm2_manager import iterm2_manager
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
@@ -577,11 +577,11 @@ async def _check_and_send_status(
     queue = _message_queues.get(user_id)
     if queue and not queue.empty():
         return
-    w = await tmux_manager.find_window_by_id(window_id)
+    w = await iterm2_manager.find_window_by_id(window_id)
     if not w:
         return
 
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await iterm2_manager.capture_pane(w.window_id)
     if not pane_text:
         return
 

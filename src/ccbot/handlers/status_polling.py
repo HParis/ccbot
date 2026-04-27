@@ -6,7 +6,7 @@ Provides background polling of terminal status lines for all active users:
   - Updates status messages in Telegram
   - Polls thread_bindings (each topic = one window)
   - Periodically probes topic existence via unpin_all_forum_topic_messages
-    (silent no-op when no pins); cleans up deleted topics (kills tmux window
+    (silent no-op when no pins); cleans up deleted topics (kills iTerm2 tab
     + unbinds thread)
 
 Key components:
@@ -25,7 +25,7 @@ from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
-from ..tmux_manager import tmux_manager
+from ..iterm2_manager import iterm2_manager
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -59,7 +59,7 @@ async def update_status_message(
     Also detects permission prompt UIs (not triggered via JSONL) and enters
     interactive mode when found.
     """
-    w = await tmux_manager.find_window_by_id(window_id)
+    w = await iterm2_manager.find_window_by_id(window_id)
     if not w:
         # Window gone, enqueue clear (unless skipping status)
         if not skip_status:
@@ -68,7 +68,7 @@ async def update_status_message(
             )
         return
 
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await iterm2_manager.capture_pane(w.window_id)
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
@@ -152,9 +152,9 @@ async def status_poll_loop(bot: Bot) -> None:
                     except BadRequest as e:
                         if "Topic_id_invalid" in str(e):
                             # Topic deleted — kill window, unbind, and clean up state
-                            w = await tmux_manager.find_window_by_id(wid)
+                            w = await iterm2_manager.find_window_by_id(wid)
                             if w:
-                                await tmux_manager.kill_window(w.window_id)
+                                await iterm2_manager.kill_window(w.window_id)
                             session_manager.unbind_thread(user_id, thread_id)
                             await clear_topic_state(user_id, thread_id, bot)
                             logger.info(
@@ -186,11 +186,11 @@ async def status_poll_loop(bot: Bot) -> None:
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
                     # Clean up stale bindings (window no longer exists)
-                    w = await tmux_manager.find_window_by_id(wid)
+                    w = await iterm2_manager.find_window_by_id(wid)
                     if not w:
                         display = session_manager.get_display_name(wid)
                         # Try auto-rebind: find unbound window with same name
-                        all_windows = await tmux_manager.list_windows()
+                        all_windows = await iterm2_manager.list_windows()
                         bound_wids = {
                             bw
                             for _, _, bw in session_manager.iter_thread_bindings()

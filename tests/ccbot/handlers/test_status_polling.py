@@ -51,14 +51,14 @@ class TestStatusPollerSettingsDetection:
         mock_window.window_id = window_id
 
         with (
-            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.status_polling.iterm2_manager") as mock_iterm,
             patch(
                 "ccbot.handlers.status_polling.handle_interactive_ui",
                 new_callable=AsyncMock,
             ) as mock_handle_ui,
         ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value=sample_pane_settings)
             mock_handle_ui.return_value = True
 
             await update_status_message(
@@ -83,7 +83,7 @@ class TestStatusPollerSettingsDetection:
         )
 
         with (
-            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.status_polling.iterm2_manager") as mock_iterm,
             patch(
                 "ccbot.handlers.status_polling.handle_interactive_ui",
                 new_callable=AsyncMock,
@@ -93,8 +93,8 @@ class TestStatusPollerSettingsDetection:
                 new_callable=AsyncMock,
             ),
         ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.capture_pane = AsyncMock(return_value=normal_pane)
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value=normal_pane)
 
             await update_status_message(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
@@ -116,14 +116,14 @@ class TestStatusPollerSettingsDetection:
         mock_window.window_id = window_id
 
         with (
-            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux_poll,
-            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux_ui,
+            patch("ccbot.handlers.status_polling.iterm2_manager") as mock_iterm_poll,
+            patch("ccbot.handlers.interactive_ui.iterm2_manager") as mock_iterm_ui,
             patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
         ):
-            mock_tmux_poll.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux_poll.capture_pane = AsyncMock(return_value=sample_pane_settings)
-            mock_tmux_ui.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux_ui.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_iterm_poll.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm_poll.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_iterm_ui.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm_ui.capture_pane = AsyncMock(return_value=sample_pane_settings)
             mock_sm.resolve_chat_id.return_value = 100
 
             await update_status_message(

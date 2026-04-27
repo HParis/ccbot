@@ -1,14 +1,14 @@
 """Telegram bot handlers — the main UI layer of CCBot.
 
 Registers all command/callback/message handlers and manages the bot lifecycle.
-Each Telegram topic maps 1:1 to a tmux window (Claude session).
+Each Telegram topic maps 1:1 to a iTerm2 tab (Claude session).
 
 Core responsibilities:
   - Command handlers: /start, /history, /screenshot, /esc, /kill, /unbind,
-    plus forwarding unknown /commands to Claude Code via tmux.
+    plus forwarding unknown /commands to Claude Code via iTerm2.
   - Callback query handler: directory browser, history pagination,
     interactive UI navigation, screenshot refresh.
-  - Topic-based routing: each named topic binds to one tmux window.
+  - Topic-based routing: each named topic binds to one iTerm2 tab.
     Unbound topics trigger the directory browser to create a new session.
   - Photo handling: photos sent by user are downloaded and forwarded
     to Claude Code as file paths (photo_handler).
@@ -135,7 +135,7 @@ from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
-from .tmux_manager import tmux_manager
+from .iterm2_manager import iterm2_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
 from .utils import ccbot_dir
@@ -151,7 +151,7 @@ _status_poll_task: asyncio.Task | None = None
 # Polling watchdog task
 _polling_watchdog_task: asyncio.Task | None = None
 
-# Claude Code commands shown in bot menu (forwarded via tmux)
+# Claude Code commands shown in bot menu (forwarded as keystrokes)
 CC_COMMANDS: dict[str, str] = {
     "clear": "↗ Clear conversation history",
     "compact": "↗ Compact conversation context",
@@ -219,7 +219,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def screenshot_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Capture the current tmux pane and send it as an image."""
+    """Capture the current iTerm2 session and send it as an image."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -232,13 +232,13 @@ async def screenshot_command(
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
-    w = await tmux_manager.find_window_by_id(wid)
+    w = await iterm2_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
 
-    text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
+    text = await iterm2_manager.capture_pane(w.window_id, with_ansi=True)
     if not text:
         await safe_reply(update.message, "❌ Failed to capture pane content.")
         return
@@ -277,7 +277,7 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await safe_reply(
         update.message,
         f"✅ Topic unbound from window '{display}'.\n"
-        "The Claude session is still running in tmux.\n"
+        "The Claude session is still running in iTerm2.\n"
         "Send a message to bind to a new session.",
     )
 
@@ -296,14 +296,14 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
-    w = await tmux_manager.find_window_by_id(wid)
+    w = await iterm2_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
 
     # Send Escape control character (no enter)
-    await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
+    await iterm2_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
@@ -321,19 +321,19 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, "No session bound to this topic.")
         return
 
-    w = await tmux_manager.find_window_by_id(wid)
+    w = await iterm2_manager.find_window_by_id(wid)
     if not w:
         await safe_reply(update.message, f"Window '{wid}' no longer exists.")
         return
 
     # Send /usage command to Claude Code TUI
-    await tmux_manager.send_keys(w.window_id, "/usage")
+    await iterm2_manager.send_keys(w.window_id, "/usage")
     # Wait for the modal to render
     await asyncio.sleep(2.0)
     # Capture the pane content
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await iterm2_manager.capture_pane(w.window_id)
     # Dismiss the modal
-    await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+    await iterm2_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
 
     if not pane_text:
         await safe_reply(update.message, "Failed to capture usage info.")
@@ -356,7 +356,7 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- Screenshot keyboard with quick control keys ---
 
-# key_id → (tmux_key, enter, literal)
+# key_id → (key_text, enter, literal)
 _KEYS_SEND_MAP: dict[str, tuple[str, bool, bool]] = {
     "up": ("Up", False, False),
     "dn": ("Down", False, False),
@@ -410,7 +410,7 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
 async def topic_closed_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle topic closure — kill the associated tmux window and clean up state."""
+    """Handle topic closure — kill the associated iTerm2 tab and clean up state."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -422,9 +422,9 @@ async def topic_closed_handler(
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid:
         display = session_manager.get_display_name(wid)
-        w = await tmux_manager.find_window_by_id(wid)
+        w = await iterm2_manager.find_window_by_id(wid)
         if w:
-            await tmux_manager.kill_window(w.window_id)
+            await iterm2_manager.kill_window(w.window_id)
             logger.info(
                 "Topic closed: killed window %s (user=%d, thread=%d)",
                 display,
@@ -450,7 +450,7 @@ async def topic_closed_handler(
 async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle topic rename — sync new name to tmux window and internal state."""
+    """Handle topic rename — sync new name to iTerm2 tab and internal state."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -476,7 +476,7 @@ async def topic_edited_handler(
         return
 
     old_name = session_manager.get_display_name(wid)
-    await tmux_manager.rename_window(wid, new_name)
+    await iterm2_manager.rename_window(wid, new_name)
     session_manager.update_display_name(wid, new_name)
     logger.info(
         "Topic renamed: '%s' -> '%s' (window=%s, user=%d, thread=%d)",
@@ -515,7 +515,7 @@ async def forward_command_handler(
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
-    w = await tmux_manager.find_window_by_id(wid)
+    w = await iterm2_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
@@ -597,7 +597,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    w = await tmux_manager.find_window_by_id(wid)
+    w = await iterm2_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
@@ -675,7 +675,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    w = await tmux_manager.find_window_by_id(wid)
+    w = await iterm2_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
@@ -731,7 +731,7 @@ async def _capture_bash_output(
     window_id: str,
     command: str,
 ) -> None:
-    """Background task: capture ``!`` bash command output from tmux pane.
+    """Background task: capture ``!`` bash command output from iTerm2 session.
 
     Sends the first captured output as a new message, then edits it
     in-place as more output appears.  Stops after 30 s or when cancelled
@@ -746,7 +746,7 @@ async def _capture_bash_output(
         last_output: str = ""
 
         for _ in range(30):
-            raw = await tmux_manager.capture_pane(window_id)
+            raw = await iterm2_manager.capture_pane(window_id)
             if raw is None:
                 return
 
@@ -885,7 +885,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
         # Unbound topic — check for unbound windows first
-        all_windows = await tmux_manager.list_windows()
+        all_windows = await iterm2_manager.list_windows()
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         unbound = [
             (w.window_id, w.window_name, w.cwd)
@@ -935,11 +935,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     # Bound topic — forward to bound window
-    w = await tmux_manager.find_window_by_id(wid)
+    w = await iterm2_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         # Try auto-rebind: find unbound window with same name
-        all_windows = await tmux_manager.list_windows()
+        all_windows = await iterm2_manager.list_windows()
         bound_wids = {
             bw for _, _, bw in session_manager.iter_thread_bindings() if bw != wid
         }
@@ -987,7 +987,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Check for pending interactive UI before sending text.
     # This catches UIs (permission prompts, etc.) that status polling might have missed.
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await iterm2_manager.capture_pane(w.window_id)
     if pane_text and is_interactive_ui(pane_text):
         # UI detected — show it to user, then send text (acts as Enter)
         logger.info(
@@ -1030,7 +1030,7 @@ async def _create_and_bind_window(
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
 ) -> None:
-    """Create a tmux window, bind it to a topic, and forward pending text.
+    """Create a iTerm2 tab, bind it to a topic, and forward pending text.
 
     Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
     """
@@ -1039,7 +1039,7 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
-    success, message, created_wname, created_wid = await tmux_manager.create_window(
+    success, message, created_wname, created_wid = await iterm2_manager.create_window(
         selected_path, resume_session_id=resume_session_id
     )
     if success:
@@ -1197,7 +1197,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Invalid data")
             return
 
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
             await send_history(
                 query,
@@ -1476,7 +1476,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         selected_wid = cached_windows[idx]
 
         # Verify window still exists
-        w = await tmux_manager.find_window_by_id(selected_wid)
+        w = await iterm2_manager.find_window_by_id(selected_wid)
         if not w:
             display = session_manager.get_display_name(selected_wid)
             await query.answer(f"Window '{display}' no longer exists", show_alert=True)
@@ -1568,12 +1568,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Screenshot: Refresh
     elif data.startswith(CB_SCREENSHOT_REFRESH):
         window_id = data[len(CB_SCREENSHOT_REFRESH) :]
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if not w:
             await query.answer("Window no longer exists", show_alert=True)
             return
 
-        text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
+        text = await iterm2_manager.capture_pane(w.window_id, with_ansi=True)
         if not text:
             await query.answer("Failed to capture pane", show_alert=True)
             return
@@ -1599,9 +1599,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
+            await iterm2_manager.send_keys(
+                w.window_id, "Up", enter=False, literal=False
+            )
             await asyncio.sleep(0.5)
             await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer()
@@ -1610,9 +1612,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_DOWN):
         window_id = data[len(CB_ASK_DOWN) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
+            await iterm2_manager.send_keys(
                 w.window_id, "Down", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1623,9 +1625,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_LEFT):
         window_id = data[len(CB_ASK_LEFT) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
+            await iterm2_manager.send_keys(
                 w.window_id, "Left", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1636,9 +1638,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_RIGHT):
         window_id = data[len(CB_ASK_RIGHT) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
+            await iterm2_manager.send_keys(
                 w.window_id, "Right", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1649,9 +1651,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_ESC):
         window_id = data[len(CB_ASK_ESC) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
+            await iterm2_manager.send_keys(
                 w.window_id, "Escape", enter=False, literal=False
             )
             await clear_interactive_msg(user.id, context.bot, thread_id)
@@ -1661,9 +1663,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_ENTER):
         window_id = data[len(CB_ASK_ENTER) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
+            await iterm2_manager.send_keys(
                 w.window_id, "Enter", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1674,9 +1676,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_SPACE):
         window_id = data[len(CB_ASK_SPACE) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
+            await iterm2_manager.send_keys(
                 w.window_id, "Space", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1687,9 +1689,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_TAB):
         window_id = data[len(CB_ASK_TAB) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
+        w = await iterm2_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
+            await iterm2_manager.send_keys(
+                w.window_id, "Tab", enter=False, literal=False
+            )
             await asyncio.sleep(0.5)
             await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("⇥ Tab")
@@ -1701,7 +1705,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
 
-    # Screenshot quick keys: send key to tmux window
+    # Screenshot quick keys: send key to iTerm2 tab
     elif data.startswith(CB_KEYS_PREFIX):
         rest = data[len(CB_KEYS_PREFIX) :]
         colon_idx = rest.find(":")
@@ -1716,20 +1720,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Unknown key")
             return
 
-        tmux_key, enter, literal = key_info
-        w = await tmux_manager.find_window_by_id(window_id)
+        key_text, enter, literal = key_info
+        w = await iterm2_manager.find_window_by_id(window_id)
         if not w:
             await query.answer("Window not found", show_alert=True)
             return
 
-        await tmux_manager.send_keys(
-            w.window_id, tmux_key, enter=enter, literal=literal
+        await iterm2_manager.send_keys(
+            w.window_id, key_text, enter=enter, literal=literal
         )
         await query.answer(_KEY_LABELS.get(key_id, key_id))
 
         # Refresh screenshot after key press
         await asyncio.sleep(0.5)
-        text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
+        text = await iterm2_manager.capture_pane(w.window_id, with_ansi=True)
         if text:
             png_bytes = await text_to_image(text, with_ansi=True)
             keyboard = _build_screenshot_keyboard(window_id)
@@ -1863,7 +1867,7 @@ async def post_init(application: Application) -> None:
 
     await application.bot.set_my_commands(bot_commands)
 
-    # Re-resolve stale window IDs from persisted state against live tmux windows
+    # Re-resolve stale window IDs from persisted state against live iTerm2 tabs
     await session_manager.resolve_stale_ids()
 
     # Pre-fill global rate limiter bucket on restart.
@@ -2108,7 +2112,7 @@ def create_bot() -> Application:
             topic_closed_handler,
         )
     )
-    # Topic edited event — sync renamed topic to tmux window
+    # Topic edited event — sync renamed topic to iTerm2 tab
     application.add_handler(
         MessageHandler(
             filters.StatusUpdate.FORUM_TOPIC_EDITED,

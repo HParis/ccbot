@@ -145,13 +145,82 @@ class TestDisplayNames:
 
 
 class TestIsWindowId:
-    def test_valid_ids(self, mgr: SessionManager) -> None:
+    def test_legacy_tmux_ids(self, mgr: SessionManager) -> None:
+        """``@N`` is the legacy tmux format; kept recognisable so
+        resolve_stale_ids can re-key these entries via display name."""
         assert mgr._is_window_id("@0") is True
         assert mgr._is_window_id("@12") is True
         assert mgr._is_window_id("@999") is True
+
+    def test_iterm2_uuids(self, mgr: SessionManager) -> None:
+        """iTerm2 session UUIDs (current format) — case-insensitive."""
+        assert mgr._is_window_id("9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB") is True
+        assert mgr._is_window_id("9f2e3a1b-dead-beef-cafe-0123456789ab") is True
 
     def test_invalid_ids(self, mgr: SessionManager) -> None:
         assert mgr._is_window_id("myproject") is False
         assert mgr._is_window_id("@") is False
         assert mgr._is_window_id("") is False
         assert mgr._is_window_id("@abc") is False
+        # Truncated UUID
+        assert mgr._is_window_id("9F2E3A1B-DEAD-BEEF-CAFE") is False
+
+
+class TestResolveStaleIdsTmuxMigration:
+    """Migration path: state.json carries @N tmux IDs but live iTerm2
+    only knows UUIDs. resolve_stale_ids must look up the display name
+    against live iTerm2 sessions and re-key the bindings."""
+
+    async def test_remaps_tmux_id_to_iterm_uuid_via_display_name(
+        self, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITermWindow
+        from ccbot.session import SessionManager, WindowState
+
+        mgr = SessionManager()
+        # Seed legacy state: thread bound to tmux @5, named "myproj".
+        mgr.thread_bindings = {1: {42: "@5"}}
+        mgr.window_states = {"@5": WindowState(window_name="myproj", cwd="/tmp")}
+        mgr.window_display_names = {"@5": "myproj"}
+
+        live_uuid = "9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB"
+        live = [
+            ITermWindow(
+                window_id=live_uuid,
+                window_name="myproj",
+                cwd="/tmp",
+                pane_current_command="",
+            )
+        ]
+        with patch(
+            "ccbot.session.iterm2_manager.list_windows",
+            AsyncMock(return_value=live),
+        ):
+            await mgr.resolve_stale_ids()
+
+        assert mgr.thread_bindings[1][42] == live_uuid
+        assert live_uuid in mgr.window_states
+        assert "@5" not in mgr.window_states
+        assert mgr.window_display_names[live_uuid] == "myproj"
+
+    async def test_drops_unrecoverable_legacy_binding(self, monkeypatch) -> None:
+        """When the display name has no live iTerm2 match, the binding
+        is dropped so the topic falls into the unbound-topic flow."""
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.session import SessionManager, WindowState
+
+        mgr = SessionManager()
+        mgr.thread_bindings = {1: {42: "@5"}}
+        mgr.window_states = {"@5": WindowState(window_name="gone", cwd="/tmp")}
+        mgr.window_display_names = {"@5": "gone"}
+
+        with patch(
+            "ccbot.session.iterm2_manager.list_windows", AsyncMock(return_value=[])
+        ):
+            await mgr.resolve_stale_ids()
+
+        assert 42 not in mgr.thread_bindings.get(1, {})
+        assert "@5" not in mgr.window_states

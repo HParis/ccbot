@@ -23,10 +23,10 @@ class TestConfigValid:
         assert cfg.telegram_bot_token == "test:token"
         assert cfg.allowed_users == {12345}
 
-    def test_custom_tmux_session_name(self, monkeypatch):
-        monkeypatch.setenv("TMUX_SESSION_NAME", "mysession")
+    def test_custom_iterm2_profile_name(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_ITERM2_PROFILE", "myprofile")
         cfg = Config()
-        assert cfg.tmux_session_name == "mysession"
+        assert cfg.iterm2_profile_name == "myprofile"
 
     def test_custom_monitor_poll_interval(self, monkeypatch):
         monkeypatch.setenv("MONITOR_POLL_INTERVAL", "5.0")

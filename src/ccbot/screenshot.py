@@ -1,6 +1,6 @@
 """Terminal text → PNG screenshot renderer.
 
-Converts captured tmux pane text (with optional ANSI color codes) into a
+Converts captured iTerm2 pane text (with optional ANSI color codes) into a
 dark-background PNG image. Supports full ANSI color parsing (16/256/RGB)
 and a three-tier font fallback chain:
   1. JetBrains Mono — Latin, symbols, box-drawing
