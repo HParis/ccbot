@@ -37,6 +37,7 @@ import io
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from telegram import (
     Bot,
@@ -146,6 +147,9 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Polling watchdog task
+_polling_watchdog_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -937,9 +941,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Try auto-rebind: find unbound window with same name
         all_windows = await tmux_manager.list_windows()
         bound_wids = {
-            bw
-            for _, _, bw in session_manager.iter_thread_bindings()
-            if bw != wid
+            bw for _, _, bw in session_manager.iter_thread_bindings() if bw != wid
         }
         candidates = [
             win
@@ -949,8 +951,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if len(candidates) == 1:
             replacement = candidates[0]
             logger.info(
-                "Auto-rebinding stale window %s -> %s "
-                "(name=%s, user=%d, thread=%d)",
+                "Auto-rebinding stale window %s -> %s (name=%s, user=%d, thread=%d)",
                 wid,
                 replacement.window_id,
                 display,
@@ -1799,7 +1800,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(user_id, bot, thread_id)
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
+        if not config.show_tool_calls and msg.content_type in (
+            "tool_use",
+            "tool_result",
+        ):
             continue
 
         parts = build_response_parts(
@@ -1887,9 +1891,159 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start polling watchdog — restarts the updater if its polling task dies
+    global _polling_watchdog_task
+    _polling_watchdog_task = asyncio.create_task(_watch_polling_task(application))
+    logger.info("Polling watchdog started")
+
+
+async def _restart_polling(updater: Any) -> bool:
+    """Stop polling, reset the httpx connection pool, and restart.
+
+    Simply restarting the updater is not enough — the httpx client retains
+    its exhausted connection pool.  We must shutdown and reinitialize the
+    bot's HTTP client to get a fresh pool.
+    """
+    try:
+        try:
+            await updater.stop()
+        except Exception:
+            pass  # Already dead, ignore cleanup errors
+
+        # Reset the httpx connection pool by recycling the HTTP client
+        bot = updater.bot
+        try:
+            await bot.shutdown()
+        except Exception:
+            pass
+        await bot.initialize()
+
+        await updater.start_polling(
+            allowed_updates=["message", "callback_query"],
+            timeout=3,
+        )
+        logger.info("Updater restarted successfully by watchdog (pool reset)")
+        return True
+    except Exception:
+        logger.exception("Failed to restart updater")
+        return False
+
+
+async def _reset_bot_request_pool(bot: Any) -> bool:
+    """Recycle the bot's main HTTP client to recover from pool exhaustion.
+
+    When the sending pool is stuck (all connections occupied), simply waiting
+    won't help — the connections are leaked.  Shutting down the underlying
+    httpx client forces all connections closed and re-initializing creates a
+    fresh pool.
+    """
+    try:
+        await bot.shutdown()
+        await bot.initialize()
+        logger.info("Bot request pool reset successfully")
+        return True
+    except Exception:
+        logger.exception("Failed to reset bot request pool")
+        return False
+
+
+async def _watch_polling_task(application: Application) -> None:
+    """Watchdog that detects dead/stuck polling and exhausted sending pool.
+
+    Detects three failure modes:
+    1. Polling task died (exception/cancelled) — checked via task.done()
+    2. Polling task alive but stuck — checked via getWebhookInfo
+       pending_update_count.  If Telegram reports pending updates for 2
+       consecutive checks (30s), the polling loop is stuck and gets restarted.
+    3. Sending pool exhausted — tested by making a lightweight getMe() call
+       through the bot's own pool.  If it times out for 2 consecutive checks,
+       the pool is recycled.
+    """
+    updater = application.updater
+    if not updater:
+        return
+
+    consecutive_pending = 0
+    consecutive_pool_failures = 0
+
+    while True:
+        await asyncio.sleep(15)
+
+        # --- Check 1: polling task died ---
+        polling_task: asyncio.Task | None = getattr(
+            updater, "_Updater__polling_task", None
+        )
+        if polling_task is not None and polling_task.done():
+            exc = polling_task.exception() if not polling_task.cancelled() else None
+            logger.critical(
+                "Polling task died (exception: %s), restarting...",
+                exc,
+                exc_info=exc,
+            )
+            if await _restart_polling(updater):
+                consecutive_pending = 0
+            continue
+
+        # --- Check 2: polling alive but stuck ---
+        # Use a standalone httpx request (NOT the bot's connection pool,
+        # which may itself be exhausted — the very condition we're detecting).
+        try:
+            import httpx
+
+            token = application.bot.token
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://api.telegram.org/bot{token}/getWebhookInfo"
+                )
+                data = resp.json()
+            pending = data.get("result", {}).get("pending_update_count", 0)
+        except Exception:
+            # Network genuinely down — restart won't help
+            continue
+
+        if pending > 0:
+            consecutive_pending += 1
+            if consecutive_pending >= 2:
+                logger.critical(
+                    "Polling stuck: %d pending updates for %d consecutive "
+                    "checks, restarting...",
+                    pending,
+                    consecutive_pending,
+                )
+                if await _restart_polling(updater):
+                    consecutive_pending = 0
+        else:
+            consecutive_pending = 0
+
+        # --- Check 3: sending pool exhausted ---
+        # Probe the bot's OWN pool with a lightweight call.  If the pool
+        # is stuck, this will raise PoolTimeout within pool_timeout seconds.
+        try:
+            await asyncio.wait_for(application.bot.get_me(), timeout=12.0)
+            consecutive_pool_failures = 0
+        except Exception:
+            consecutive_pool_failures += 1
+            if consecutive_pool_failures >= 2:
+                logger.critical(
+                    "Bot request pool exhausted for %d consecutive checks, "
+                    "resetting...",
+                    consecutive_pool_failures,
+                )
+                if await _reset_bot_request_pool(application.bot):
+                    consecutive_pool_failures = 0
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _polling_watchdog_task
+
+    # Stop polling watchdog
+    if _polling_watchdog_task:
+        _polling_watchdog_task.cancel()
+        try:
+            await _polling_watchdog_task
+        except asyncio.CancelledError:
+            pass
+        _polling_watchdog_task = None
 
     # Stop status polling
     if _status_poll_task:
@@ -1912,12 +2066,31 @@ async def post_shutdown(application: Application) -> None:
 
 
 def create_bot() -> Application:
+    from telegram.request import HTTPXRequest
+
+    # Default pool_timeout is 1.0s — far too aggressive.  When the network
+    # hiccups, connections get stuck, the pool fills, and every subsequent
+    # request fails instantly, creating an irrecoverable cascade.
+    #
+    # read_timeout / write_timeout cap how long a *single* request can block
+    # a connection, preventing leaked connections from accumulating.
+    _request_kwargs = dict(
+        pool_timeout=10.0,  # wait up to 10s for a free connection
+        connect_timeout=10.0,  # TCP connect
+        read_timeout=15.0,  # read response (default 5s too tight for edits)
+        write_timeout=15.0,  # send request body
+    )
+
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
+        .request(HTTPXRequest(**_request_kwargs))
+        .get_updates_request(
+            HTTPXRequest(pool_timeout=5.0, connect_timeout=10.0, read_timeout=15.0)
+        )
         .build()
     )
 
@@ -1964,9 +2137,7 @@ def create_bot() -> Application:
     return application
 
 
-async def _error_handler(
-    update: object, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors from the polling loop and handlers.
 
     Without this handler, python-telegram-bot logs a noisy traceback for every
@@ -1974,15 +2145,21 @@ async def _error_handler(
     registered``.  More importantly, registering the handler ensures the
     library's internal ``network_retry_loop`` properly retries on
     ``NetworkError`` rather than letting unhandled exceptions propagate.
+
+    CRITICAL: This handler MUST NOT raise — an unhandled exception here can
+    kill the polling task, leaving the bot process alive but deaf to messages.
     """
-    err = context.error
-    if isinstance(err, (NetworkError, TimedOut)):
-        logger.debug("Network error in polling: %s", err)
-    elif isinstance(err, RetryAfter):
-        logger.warning("Rate limited, retry after %ss", err.retry_after)
-    elif isinstance(err, Conflict):
-        logger.error(
-            "Conflict: another bot instance is running with the same token"
-        )
-    else:
-        logger.error("Unhandled error: %s", err, exc_info=err)
+    try:
+        err = context.error
+        if isinstance(err, (NetworkError, TimedOut)):
+            logger.debug("Network error in polling: %s", err)
+        elif isinstance(err, RetryAfter):
+            logger.warning("Rate limited, retry after %ss", err.retry_after)
+        elif isinstance(err, Conflict):
+            logger.error(
+                "Conflict: another bot instance is running with the same token"
+            )
+        else:
+            logger.error("Unhandled error: %s", err, exc_info=err)
+    except Exception:
+        logger.exception("Error handler itself failed")
