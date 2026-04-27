@@ -57,9 +57,16 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
-        # Tmux session name and window naming
+        # Tmux session name and window naming (legacy — read sites are
+        # being migrated to iTerm2 in this branch; remove in Unit 6)
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
         self.tmux_main_window_name = "__main__"
+
+        # iTerm2 profile used for ccbot-owned tabs. The profile should
+        # have its Title field set to "Session Name" so the bot's
+        # set_name() call is authoritative (Claude Code's TUI cannot
+        # override it via OSC sequences).
+        self.iterm2_profile_name = os.getenv("CCBOT_ITERM2_PROFILE", "ccbot")
 
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
