@@ -88,9 +88,6 @@ def test_signature_parity_with_tmux_manager() -> None:
 @pytest.mark.parametrize(
     "method_name,args",
     [
-        # Unit 3
-        ("capture_pane", ("UUID",)),
-        ("send_keys", ("UUID", "hi")),
         # Unit 4
         ("rename_window", ("UUID", "new")),
         ("kill_window", ("UUID",)),
@@ -327,3 +324,339 @@ async def test_invalidate_connection_forces_reconnect() -> None:
 
     assert a is first
     assert b is second
+
+
+# ----------------------------------------------------------------------
+# Unit 3: send_keys + capture_pane
+# ----------------------------------------------------------------------
+
+
+def _bind_session(mgr: ITerm2Manager, session: MagicMock) -> Any:
+    """Patch the manager so _resolve_session returns ``session``."""
+    return patch.object(mgr, "_resolve_session", AsyncMock(return_value=session))
+
+
+async def test_send_keys_literal_with_enter_uses_two_phase_timing(
+    monkeypatch: Any,
+) -> None:
+    """Literal text with Enter sends text → 500ms gap → \\r."""
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("ccbot.iterm2_manager._sleep", record_sleep)
+
+    session = MagicMock()
+    sent: list[str] = []
+    session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.send_keys("UUID", "hello")
+
+    assert ok is True
+    assert sent == ["hello", "\r"]
+    assert sleeps == [0.5]
+
+
+async def test_send_keys_bash_prefix_inserts_one_second_gap(
+    monkeypatch: Any,
+) -> None:
+    """``!cmd`` sends ``!`` first, waits 1s, then the rest, then Enter."""
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("ccbot.iterm2_manager._sleep", record_sleep)
+
+    session = MagicMock()
+    sent: list[str] = []
+    session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.send_keys("UUID", "!ls")
+
+    assert ok is True
+    assert sent == ["!", "ls", "\r"]
+    assert sleeps == [1.0, 0.5]
+
+
+async def test_send_keys_bash_prefix_alone_skips_extra_send(
+    monkeypatch: Any,
+) -> None:
+    """``!`` with no rest must not waste a 1s sleep."""
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("ccbot.iterm2_manager._sleep", record_sleep)
+
+    session = MagicMock()
+    sent: list[str] = []
+    session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.send_keys("UUID", "!")
+
+    assert ok is True
+    assert sent == ["!", "\r"]
+    assert sleeps == [0.5]
+
+
+@pytest.mark.parametrize(
+    "name,sequence",
+    [
+        ("Up", "\x1b[A"),
+        ("Down", "\x1b[B"),
+        ("Right", "\x1b[C"),
+        ("Left", "\x1b[D"),
+        ("Escape", "\x1b"),
+        ("Tab", "\t"),
+        ("Enter", "\r"),
+    ],
+)
+async def test_send_keys_special_keys_translate_correctly(
+    name: str, sequence: str
+) -> None:
+    """Named keys with literal=False expand to escape sequences."""
+    session = MagicMock()
+    sent: list[str] = []
+    session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.send_keys("UUID", name, enter=False, literal=False)
+
+    assert ok is True
+    assert sent == [sequence]
+
+
+async def test_send_keys_unknown_special_key_falls_through_literal() -> None:
+    """A literal=False key that isn't in the table is sent as-is, matching
+    the previous tmux backend's permissive behaviour."""
+    session = MagicMock()
+    sent: list[str] = []
+    session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.send_keys("UUID", "MysteryKey", enter=False, literal=False)
+
+    assert ok is True
+    assert sent == ["MysteryKey"]
+
+
+async def test_send_keys_literal_no_enter_sends_text_only() -> None:
+    session = MagicMock()
+    sent: list[str] = []
+    session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.send_keys("UUID", "\x1b", enter=False, literal=True)
+
+    assert ok is True
+    assert sent == ["\x1b"]
+
+
+async def test_send_keys_returns_false_when_session_missing() -> None:
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_resolve_session", AsyncMock(return_value=None)):
+        ok = await mgr.send_keys("UUID-MISSING", "hello")
+    assert ok is False
+
+
+async def test_send_keys_returns_false_on_send_error() -> None:
+    session = MagicMock()
+    session.async_send_text = AsyncMock(side_effect=RuntimeError("disconnected"))
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.send_keys("UUID", "hi", enter=False)
+    assert ok is False
+
+
+# --- capture_pane plain mode ---
+
+
+def _make_screen_contents(lines: list[tuple[str, list[Any]]]) -> MagicMock:
+    """Build a fake ScreenContents from (text, [style_or_None_per_char]) tuples."""
+    contents = MagicMock()
+    contents.number_of_lines = len(lines)
+
+    line_objects: list[MagicMock] = []
+    for text, styles in lines:
+        lc = MagicMock()
+        lc.string = text
+        # style_at(x) → styles[x]; out-of-range returns None
+        lc.style_at = MagicMock(
+            side_effect=lambda x, s=styles: s[x] if x < len(s) else None
+        )
+        line_objects.append(lc)
+
+    contents.line = MagicMock(side_effect=lambda i: line_objects[i])
+    return contents
+
+
+async def test_capture_pane_plain_joins_lines_with_newline() -> None:
+    contents = _make_screen_contents(
+        [("first line", [None] * 10), ("second", [None] * 6)]
+    )
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(return_value=contents)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        out = await mgr.capture_pane("UUID")
+
+    assert out == "first line\nsecond"
+
+
+async def test_capture_pane_returns_none_when_session_missing() -> None:
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_resolve_session", AsyncMock(return_value=None)):
+        assert await mgr.capture_pane("UUID-MISSING") is None
+
+
+async def test_capture_pane_returns_none_on_screen_error() -> None:
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(side_effect=RuntimeError("nope"))
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        assert await mgr.capture_pane("UUID") is None
+
+
+# --- capture_pane ANSI round-trip ---
+
+
+def _style(
+    fg_standard: int | None = None,
+    fg_rgb: tuple[int, int, int] | None = None,
+    bg_standard: int | None = None,
+) -> MagicMock:
+    """Build a minimal CellStyle stand-in that exposes fg_color / bg_color."""
+    style = MagicMock()
+
+    def _color(standard: int | None, rgb: tuple[int, int, int] | None) -> Any:
+        if standard is None and rgb is None:
+            return None
+        c = MagicMock()
+        c.standard = standard
+        if rgb is not None:
+            rgb_obj = MagicMock()
+            rgb_obj.red, rgb_obj.green, rgb_obj.blue = rgb
+            c.rgb = rgb_obj
+        else:
+            c.rgb = None
+        return c
+
+    style.fg_color = _color(fg_standard, fg_rgb)
+    style.bg_color = _color(bg_standard, None)
+    return style
+
+
+async def test_capture_pane_ansi_emits_basic_16_colour() -> None:
+    """fg standard 0-7 → SGR 30-37."""
+    red = _style(fg_standard=1)  # ANSI red
+    contents = _make_screen_contents([("X", [red])])
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(return_value=contents)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        out = await mgr.capture_pane("UUID", with_ansi=True)
+
+    assert out is not None
+    assert "\x1b[31" in out  # 30 + 1 = red
+    assert out.endswith("\x1b[0m")
+
+
+async def test_capture_pane_ansi_emits_bright_palette() -> None:
+    """fg standard 8-15 → SGR 90-97."""
+    bright_red = _style(fg_standard=9)
+    contents = _make_screen_contents([("X", [bright_red])])
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(return_value=contents)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        out = await mgr.capture_pane("UUID", with_ansi=True)
+
+    assert out is not None
+    assert "\x1b[91" in out  # 90 + (9 - 8) = 91
+
+
+async def test_capture_pane_ansi_emits_extended_256() -> None:
+    """fg standard ≥ 16 → SGR 38;5;N."""
+    s = _style(fg_standard=200)
+    contents = _make_screen_contents([("X", [s])])
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(return_value=contents)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        out = await mgr.capture_pane("UUID", with_ansi=True)
+
+    assert out is not None
+    assert "38;5;200" in out
+
+
+async def test_capture_pane_ansi_emits_rgb() -> None:
+    """fg rgb → SGR 38;2;R;G;B."""
+    s = _style(fg_rgb=(10, 20, 30))
+    contents = _make_screen_contents([("X", [s])])
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(return_value=contents)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        out = await mgr.capture_pane("UUID", with_ansi=True)
+
+    assert out is not None
+    assert "38;2;10;20;30" in out
+
+
+async def test_capture_pane_ansi_round_trips_through_screenshot_parser() -> None:
+    """Capture-with-ANSI → screenshot._parse_ansi_line preserves the
+    foreground colour of each cell. This is the core invariant: the
+    output dialect must match what screenshot.py parses."""
+    from ccbot.screenshot import _ANSI_COLORS, _parse_ansi_line
+
+    red = _style(fg_standard=1)  # screenshot maps to _ANSI_COLORS[1]
+    cyan = _style(fg_standard=6)
+    contents = _make_screen_contents([("RC", [red, cyan])])
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(return_value=contents)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ansi_line = await mgr.capture_pane("UUID", with_ansi=True)
+
+    assert ansi_line is not None
+    segments = _parse_ansi_line(ansi_line)
+    text_to_fg = {seg.text: seg.style.fg_color for seg in segments if seg.text}
+
+    assert text_to_fg["R"] == _ANSI_COLORS[1]
+    assert text_to_fg["C"] == _ANSI_COLORS[6]
+
+
+async def test_capture_pane_ansi_omits_redundant_codes_for_same_style() -> None:
+    """When two adjacent cells share a style, the second cell must NOT
+    re-emit the SGR codes — keeps the output compact and round-trips
+    cleanly through the parser."""
+    s = _style(fg_standard=2)
+    contents = _make_screen_contents([("AB", [s, s])])
+    session = MagicMock()
+    session.async_get_screen_contents = AsyncMock(return_value=contents)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        out = await mgr.capture_pane("UUID", with_ansi=True)
+
+    assert out is not None
+    # Exactly one colour-change SGR before "A", then plain "B", then reset.
+    assert out == "\x1b[32;49mAB\x1b[0m"

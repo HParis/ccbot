@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from asyncio import sleep as _sleep
 from dataclasses import dataclass
 
 import iterm2
+import iterm2.screen as iterm2_screen
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,28 @@ _RECONNECT_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
 # iTerm2 user-variable ``user.ccbot``; value is the literal "1".
 _CCBOT_TAG_NAME = "user.ccbot"
 _CCBOT_TAG_VALUE = "1"
+
+# Named-key escape sequences used when ``send_keys(..., literal=False)``.
+# Anything not listed here is sent verbatim, matching the previous
+# tmux backend's behaviour for unrecognised key names.
+_SPECIAL_KEYS: dict[str, str] = {
+    "Up": "\x1b[A",
+    "Down": "\x1b[B",
+    "Right": "\x1b[C",
+    "Left": "\x1b[D",
+    "Escape": "\x1b",
+    "Tab": "\t",
+    "Enter": "\r",
+}
+
+# Claude Code's TUI sometimes interprets a rapid Enter that arrives in
+# the same input batch as the surrounding text as a newline rather than
+# submit. The 500ms gap between text and Enter lets the TUI settle.
+_ENTER_DELAY = 0.5
+
+# Claude Code's ``!`` bash-mode prefix needs the TUI to switch modes
+# before the rest of the line arrives.
+_BASH_PREFIX_DELAY = 1.0
 
 
 @dataclass
@@ -101,7 +125,7 @@ class ITerm2Manager:
                         delay,
                         attempt + 1,
                     )
-                    await asyncio.sleep(delay)
+                    await _sleep(delay)
                 try:
                     conn = await iterm2.Connection.async_create()
                     self._connection = conn
@@ -230,23 +254,50 @@ class ITerm2Manager:
         return "" if value is None else str(value)
 
     # ------------------------------------------------------------------
-    # Stubs for later units
+    # Input / output
     # ------------------------------------------------------------------
+
+    async def _resolve_session(self, window_id: str) -> iterm2.Session | None:
+        """Return the live Session for ``window_id``, or None if missing."""
+        try:
+            app = await self._get_app()
+        except ConnectionError as e:
+            logger.warning("iTerm2 unreachable: %s", e)
+            return None
+        return app.get_session_by_id(window_id)
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a session's screen.
 
         Args:
             window_id: iTerm2 session UUID.
-            with_ansi: If True, emit SGR escape codes (16/256/RGB color
-                + bold) in the dialect ``screenshot.py`` understands. If
+            with_ansi: If True, emit SGR escape codes (16/256/RGB
+                color) in the dialect ``screenshot.py`` understands. If
                 False, return plain text only.
 
         Returns:
             Captured text (one ``\\n``-joined string), or ``None`` on
             failure.
         """
-        raise NotImplementedError("Unit 3")
+        session = await self._resolve_session(window_id)
+        if session is None:
+            logger.debug("capture_pane: session not found: %s", window_id)
+            return None
+
+        try:
+            contents = await session.async_get_screen_contents()
+        except Exception as e:
+            logger.error("Failed to get screen contents for %s: %s", window_id, e)
+            return None
+
+        lines: list[str] = []
+        for i in range(contents.number_of_lines):
+            line = contents.line(i)
+            if with_ansi:
+                lines.append(_line_to_ansi(line))
+            else:
+                lines.append(line.string)
+        return "\n".join(lines)
 
     async def send_keys(
         self,
@@ -275,7 +326,37 @@ class ITerm2Manager:
         Returns:
             True on success, False otherwise.
         """
-        raise NotImplementedError("Unit 3")
+        session = await self._resolve_session(window_id)
+        if session is None:
+            logger.error("send_keys: session not found: %s", window_id)
+            return False
+
+        try:
+            if literal and enter:
+                # Two-phase send so the TUI sees text and Enter as
+                # separate events. !-prefix needs an extra 1s gap so
+                # the TUI switches into bash mode first.
+                if text.startswith("!"):
+                    await session.async_send_text("!")
+                    rest = text[1:]
+                    if rest:
+                        await _sleep(_BASH_PREFIX_DELAY)
+                        await session.async_send_text(rest)
+                else:
+                    await session.async_send_text(text)
+                await _sleep(_ENTER_DELAY)
+                await session.async_send_text("\r")
+                return True
+
+            # Single-shot send for special keys or no-Enter cases.
+            payload = text if literal else _SPECIAL_KEYS.get(text, text)
+            if enter:
+                payload += "\r"
+            await session.async_send_text(payload)
+            return True
+        except Exception as e:
+            logger.error("send_keys to %s failed: %s", window_id, e)
+            return False
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a ccbot-owned session."""
@@ -294,6 +375,92 @@ class ITerm2Manager:
     ) -> tuple[bool, str, str, str]:
         """Create a new ccbot-owned tab and optionally start Claude Code."""
         raise NotImplementedError("Unit 4")
+
+
+# ----------------------------------------------------------------------
+# ANSI reconstruction from iTerm2 cell styles
+# ----------------------------------------------------------------------
+
+
+def _color_to_sgr(
+    color: iterm2_screen.CellStyle.Color | None, is_fg: bool
+) -> tuple[str, ...]:
+    """Convert a CellStyle.Color to SGR parameter parts.
+
+    Output dialect matches ``screenshot.py:_apply_ansi_codes``:
+      - basic 16 → 30-37 / 40-47 / 90-97 / 100-107
+      - extended 256 → 38;5;N / 48;5;N
+      - RGB → 38;2;R;G;B / 48;2;R;G;B
+      - default / alternate → 39 / 49
+
+    Returns a tuple of stringified parameters (so the caller can
+    diff them between cells before joining with ``;``).
+    """
+    default = ("39",) if is_fg else ("49",)
+
+    if color is None:
+        return default
+
+    if color.standard is not None:
+        n = int(color.standard)
+        if n < 8:
+            return (str((30 if is_fg else 40) + n),)
+        if n < 16:
+            return (str((90 if is_fg else 100) + n - 8),)
+        return ("38" if is_fg else "48", "5", str(n))
+
+    if color.rgb is not None:
+        rgb = color.rgb
+        return (
+            "38" if is_fg else "48",
+            "2",
+            str(rgb.red),
+            str(rgb.green),
+            str(rgb.blue),
+        )
+
+    # alternate (DEFAULT / REVERSED_DEFAULT / SYSTEM_MESSAGE) and
+    # placement both fall back to the default colour.
+    return default
+
+
+def _line_to_ansi(line: iterm2_screen.LineContents) -> str:
+    """Re-serialize a screen line into ANSI-coloured text.
+
+    Emits SGR codes only when the colour changes from the previous cell
+    and resets at end-of-line so the next line starts clean.
+    """
+    text = line.string
+    parts: list[str] = []
+    last_fg: tuple[str, ...] | None = None
+    last_bg: tuple[str, ...] | None = None
+
+    for x, ch in enumerate(text):
+        try:
+            style = line.style_at(x)
+        except Exception:
+            style = None
+
+        if style is not None:
+            fg = _color_to_sgr(style.fg_color, is_fg=True)
+            bg = _color_to_sgr(style.bg_color, is_fg=False)
+        else:
+            fg = ("39",)
+            bg = ("49",)
+
+        codes: list[str] = []
+        if fg != last_fg:
+            codes.extend(fg)
+            last_fg = fg
+        if bg != last_bg:
+            codes.extend(bg)
+            last_bg = bg
+        if codes:
+            parts.append(f"\x1b[{';'.join(codes)}m")
+        parts.append(ch)
+
+    parts.append("\x1b[0m")
+    return "".join(parts)
 
 
 iterm2_manager = ITerm2Manager()
