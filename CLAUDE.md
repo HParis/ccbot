@@ -1,8 +1,10 @@
 # CLAUDE.md
 
-ccmux — Telegram bot that bridges Telegram Forum topics to Claude Code sessions via tmux windows. Each topic is bound to one tmux window running one Claude Code instance.
+ccbot — Telegram bot that bridges Telegram Forum topics to Claude Code sessions via iTerm2 tabs. Each topic is bound to one iTerm2 session (UUID) running one Claude Code instance.
 
-Tech stack: Python, python-telegram-bot, tmux, uv.
+Tech stack: Python, python-telegram-bot, iTerm2 Python API, uv.
+
+**Platform: macOS only.** iTerm2 must be running and the iTerm2 Python API must be enabled (Preferences → General → Magic → Enable Python API).
 
 ## Common Commands
 
@@ -16,11 +18,13 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 
 ## Core Design Constraints
 
-- **1 Topic = 1 Window = 1 Session** — all internal routing keyed by tmux window ID (`@0`, `@12`), not window name. Window names kept as display names. Same directory can have multiple windows.
+- **1 Topic = 1 Tab = 1 Session** — all internal routing keyed by iTerm2 session UUID, not tab name. Tab names are stored separately as display names. Same directory can have multiple tabs.
+- **ccbot tabs are tagged** with the iTerm2 user variable `user.ccbot=1`. Untagged tabs (the user's own shells) are invisible to the bot.
+- **iTerm2 must stay open** — closing iTerm2 kills every Claude Code session the bot is managing. The bot reconnects automatically when iTerm2 starts again, but in-flight Claude work is lost.
 - **Topic-only** — no backward-compat for non-topic mode. No `active_sessions`, no `/list`, no General topic routing.
 - **No message truncation** at parse layer — splitting only at send layer (`split_message`, 4096 char limit).
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.
-- **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
+- **Hook-based session tracking** — `SessionStart` hook reads `ITERM_SESSION_ID`, writes `session_map.json` keyed `iterm:<UUID>`; monitor polls it to detect session changes.
 - **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
 - **Rate limiting** — `AIORateLimiter(max_retries=5)` on the Application (30/s global). On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
 
@@ -34,6 +38,11 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - Config directory: `~/.ccbot/` by default, override with `CCBOT_DIR` env var.
 - `.env` loading priority: local `.env` > config dir `.env`.
 - State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets).
+- iTerm2 profile: `CCBOT_ITERM2_PROFILE` (default `ccbot`). Set the profile's Title field to "Session Name" so Claude Code's TUI cannot override the tab title via OSC.
+
+## Migration
+
+If you're upgrading from the tmux-backed version, see `docs/migration-iterm2.md` for the one-time iTerm2 setup and what happens to existing topic bindings.
 
 ## Hook Configuration
 

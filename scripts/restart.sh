@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TMUX_SESSION="ccbot"
-TMUX_WINDOW="__main__"
-TARGET="${TMUX_SESSION}:${TMUX_WINDOW}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LAUNCHD_LABEL="com.user.ccbot"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
@@ -50,7 +47,7 @@ fi
 # Brief pause to let the shell settle
 sleep 1
 
-# Start ccbot via launchd (preferred) or tmux fallback
+# Start ccbot via launchd
 if [ -f "$LAUNCHD_PLIST" ]; then
     echo "Starting ccbot via launchd..."
     launchctl load "$LAUNCHD_PLIST"
@@ -62,32 +59,9 @@ if [ -f "$LAUNCHD_PLIST" ]; then
         exit 1
     fi
 else
-    # Fallback: start in tmux window
-    # Check if tmux session and window exist
-    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        echo "Error: tmux session '$TMUX_SESSION' does not exist"
-        exit 1
-    fi
-    if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$TMUX_WINDOW"; then
-        echo "Error: window '$TMUX_WINDOW' not found in session '$TMUX_SESSION'"
-        exit 1
-    fi
-
-    echo "Starting ccbot in $TARGET..."
-    tmux send-keys -t "$TARGET" "ccbot" Enter
-
-    sleep 3
-    PANE_PID=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}')
-    if pstree -a "$PANE_PID" 2>/dev/null | grep -q 'ccbot'; then
-        echo "ccbot restarted successfully. Recent logs:"
-        echo "----------------------------------------"
-        tmux capture-pane -t "$TARGET" -p | tail -20
-        echo "----------------------------------------"
-    else
-        echo "Warning: ccbot may not have started. Pane output:"
-        echo "----------------------------------------"
-        tmux capture-pane -t "$TARGET" -p | tail -30
-        echo "----------------------------------------"
-        exit 1
-    fi
+    echo "No launchd plist at ${LAUNCHD_PLIST}."
+    echo "Set up a LaunchAgent or start the bot manually:"
+    echo "  ccbot                # foreground"
+    echo "  nohup ccbot &        # background, logs to nohup.out"
+    exit 1
 fi
