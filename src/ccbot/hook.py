@@ -1,12 +1,17 @@
 """Hook subcommand for Claude Code session tracking.
 
-Called by Claude Code's SessionStart hook to maintain a window↔session
-mapping in <CCBOT_DIR>/session_map.json. Also provides `--install` to
-auto-configure the hook in ~/.claude/settings.json.
+Called by Claude Code's SessionStart hook to maintain an iTerm2-session
+↔ Claude-session mapping in <CCBOT_DIR>/session_map.json. Also provides
+`--install` to auto-configure the hook in ~/.claude/settings.json.
+
+The hook reads ``ITERM_SESSION_ID`` (injected by iTerm2 into every
+shell) to identify which iTerm2 session this Claude instance is
+running in, and writes a key of the form ``iterm:<UUID>`` to the map.
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
-since hooks run inside tmux panes where bot env vars are not set.
-Config directory resolution uses utils.ccbot_dir() (shared with config.py).
+since hooks run inside iTerm2 sessions where the bot env vars are not
+set. Config directory resolution uses utils.ccbot_dir() (shared with
+config.py).
 
 Key functions: hook_main() (CLI entry), _install_hook().
 """
@@ -18,7 +23,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -186,43 +190,31 @@ def hook_main() -> None:
         logger.debug("Ignoring non-SessionStart event: %s", event)
         return
 
-    # Get tmux session:window key for the pane running this hook.
-    # TMUX_PANE is set by tmux for every process inside a pane.
-    pane_id = os.environ.get("TMUX_PANE", "")
-    if not pane_id:
-        logger.warning("TMUX_PANE not set, cannot determine window")
-        return
-
-    result = subprocess.run(
-        [
-            "tmux",
-            "display-message",
-            "-t",
-            pane_id,
-            "-p",
-            "#{session_name}:#{window_id}:#{window_name}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    raw_output = result.stdout.strip()
-    # Expected format: "session_name:@id:window_name"
-    parts = raw_output.split(":", 2)
-    if len(parts) < 3:
+    # Get the iTerm2 session UUID for the shell running this hook.
+    # iTerm2 injects ITERM_SESSION_ID into every shell it starts; the
+    # value is "wXtYpZ:UUID" (window/tab/pane index, then session UUID).
+    iterm_var = os.environ.get("ITERM_SESSION_ID", "")
+    _, _, uuid = iterm_var.partition(":")
+    if not uuid:
         logger.warning(
-            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
-            pane_id,
-            raw_output,
+            "ITERM_SESSION_ID not set or malformed (got %r); "
+            "cannot determine iTerm2 session",
+            iterm_var,
         )
         return
-    tmux_session_name, window_id, window_name = parts
-    # Key uses window_id for uniqueness
-    session_window_key = f"{tmux_session_name}:{window_id}"
+    if not _UUID_RE.match(uuid.lower()):
+        logger.warning("ITERM_SESSION_ID UUID is malformed: %s", uuid)
+        return
+
+    # Key format: "iterm:<UUID>". The window_name field is left empty
+    # — the bot looks up the live name via its own iTerm2 API
+    # connection at read time, which is more reliable than running
+    # an API call from this short-lived hook subprocess.
+    session_window_key = f"iterm:{uuid}"
 
     logger.debug(
-        "tmux key=%s, window_name=%s, session_id=%s, cwd=%s",
+        "iterm key=%s, session_id=%s, cwd=%s",
         session_window_key,
-        window_name,
         session_id,
         cwd,
     )
@@ -251,15 +243,8 @@ def hook_main() -> None:
                 session_map[session_window_key] = {
                     "session_id": session_id,
                     "cwd": cwd,
-                    "window_name": window_name,
+                    "window_name": "",
                 }
-
-                # Clean up old-format key ("session:window_name") if it exists.
-                # Previous versions keyed by window_name instead of window_id.
-                old_key = f"{tmux_session_name}:{window_name}"
-                if old_key != session_window_key and old_key in session_map:
-                    del session_map[old_key]
-                    logger.info("Removed old-format session_map key: %s", old_key)
 
                 from .utils import atomic_write_json
 
