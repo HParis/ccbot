@@ -358,13 +358,84 @@ class ITerm2Manager:
             logger.error("send_keys to %s failed: %s", window_id, e)
             return False
 
+    # ------------------------------------------------------------------
+    # Window lifecycle
+    # ------------------------------------------------------------------
+
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a ccbot-owned session."""
-        raise NotImplementedError("Unit 4")
+        session = await self._resolve_session(window_id)
+        if session is None:
+            logger.error("rename_window: session not found: %s", window_id)
+            return False
+        try:
+            await session.async_set_name(new_name)
+            logger.info("Renamed session %s to '%s'", window_id, new_name)
+            return True
+        except Exception as e:
+            logger.error("Failed to rename session %s: %s", window_id, e)
+            return False
 
     async def kill_window(self, window_id: str) -> bool:
-        """Close a ccbot-owned session."""
-        raise NotImplementedError("Unit 4")
+        """Close a ccbot-owned session.
+
+        ccbot creates one session per tab, so closing the session also
+        closes the tab.
+        """
+        session = await self._resolve_session(window_id)
+        if session is None:
+            logger.debug("kill_window: session %s already gone", window_id)
+            return False
+        try:
+            await session.async_close(force=True)
+            logger.info("Killed session %s", window_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to close session %s: %s", window_id, e)
+            return False
+
+    async def _get_target_window(self, app: iterm2.App) -> iterm2.Window | None:
+        """Return the iTerm2 window that should host new ccbot tabs.
+
+        Preference order:
+          1. A window that already contains a ccbot-tagged session.
+          2. The user's currently active window.
+          3. None — caller must create a new window.
+        """
+        for window in app.windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    try:
+                        tag = await session.async_get_variable(_CCBOT_TAG_NAME)
+                    except Exception:
+                        tag = None
+                    if str(tag) == _CCBOT_TAG_VALUE:
+                        return window
+
+        return app.current_window
+
+    async def _create_tab_with_profile(
+        self, window: iterm2.Window
+    ) -> iterm2.Tab | None:
+        """Create a tab in ``window`` using the configured profile, or
+        the default profile if the configured one doesn't exist."""
+        try:
+            tab = await window.async_create_tab(profile=self.profile_name)
+            if tab is not None:
+                return tab
+        except Exception as e:
+            logger.warning(
+                "Failed to create tab with profile '%s' (%s); "
+                "falling back to default profile",
+                self.profile_name,
+                e,
+            )
+
+        try:
+            return await window.async_create_tab()
+        except Exception as e:
+            logger.error("Failed to create tab with default profile: %s", e)
+            return None
 
     async def create_window(
         self,
@@ -373,8 +444,101 @@ class ITerm2Manager:
         start_claude: bool = True,
         resume_session_id: str | None = None,
     ) -> tuple[bool, str, str, str]:
-        """Create a new ccbot-owned tab and optionally start Claude Code."""
-        raise NotImplementedError("Unit 4")
+        """Create a new ccbot-owned tab and optionally start Claude Code.
+
+        See class docstring for the full semantics. The actual shell
+        runs ``cd <work_dir> && claude [--resume <id>]`` so a failed
+        ``cd`` won't drop the user into a wrong-directory Claude.
+        """
+        from pathlib import Path
+        from shlex import quote
+
+        from .config import config
+
+        path = Path(work_dir).expanduser().resolve()
+        if not path.exists():
+            return False, f"Directory does not exist: {work_dir}", "", ""
+        if not path.is_dir():
+            return False, f"Not a directory: {work_dir}", "", ""
+
+        # De-dup the display name against currently-tagged sessions.
+        final_name = window_name or path.name
+        base = final_name
+        counter = 2
+        while await self.find_window_by_name(final_name) is not None:
+            final_name = f"{base}-{counter}"
+            counter += 1
+
+        try:
+            app = await self._get_app()
+        except ConnectionError as e:
+            return False, f"iTerm2 unreachable: {e}", "", ""
+
+        host = await self._get_target_window(app)
+        if host is None:
+            try:
+                conn = await self._get_connection()
+                host = await iterm2.Window.async_create(conn, profile=self.profile_name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to create iTerm2 window with profile '%s' (%s); "
+                    "falling back to default profile",
+                    self.profile_name,
+                    e,
+                )
+                try:
+                    conn = await self._get_connection()
+                    host = await iterm2.Window.async_create(conn)
+                except Exception as e2:
+                    return False, f"Failed to create iTerm2 window: {e2}", "", ""
+            if host is None:
+                return False, "iTerm2 returned no window", "", ""
+
+        tab = await self._create_tab_with_profile(host)
+        if tab is None:
+            return False, "Failed to create tab", "", ""
+
+        session = tab.current_session
+        if session is None:
+            return False, "New tab has no session", "", ""
+
+        try:
+            await session.async_set_variable(_CCBOT_TAG_NAME, _CCBOT_TAG_VALUE)
+            await session.async_set_name(final_name)
+        except Exception as e:
+            logger.error("Failed to tag/name new session: %s", e)
+            return False, f"Failed to tag/name session: {e}", "", ""
+
+        # Build the boot command.  ``exec`` replaces the shell so Claude
+        # owns the PTY directly — closing claude closes the session,
+        # matching the previous tmux behaviour.
+        cd_quoted = quote(str(path))
+        if start_claude:
+            cmd = config.claude_command
+            if resume_session_id:
+                cmd = f"{cmd} --resume {resume_session_id}"
+            boot = f"cd {cd_quoted} && exec {cmd}\n"
+        else:
+            boot = f"cd {cd_quoted}\n"
+
+        try:
+            await session.async_send_text(boot)
+        except Exception as e:
+            logger.error("Failed to send boot command: %s", e)
+            return False, f"Failed to start session: {e}", "", ""
+
+        logger.info(
+            "Created ccbot tab '%s' (uuid=%s) at %s",
+            final_name,
+            session.session_id,
+            path,
+        )
+        return (
+            True,
+            f"Created tab '{final_name}' at {path}",
+            final_name,
+            session.session_id,
+        )
 
 
 # ----------------------------------------------------------------------

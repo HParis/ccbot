@@ -85,24 +85,7 @@ def test_signature_parity_with_tmux_manager() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "method_name,args",
-    [
-        # Unit 4
-        ("rename_window", ("UUID", "new")),
-        ("kill_window", ("UUID",)),
-        ("create_window", ("/tmp",)),
-    ],
-)
-async def test_stubs_raise_not_implemented(
-    method_name: str, args: tuple[object, ...]
-) -> None:
-    """Methods not yet implemented raise NotImplementedError so
-    accidental upper-layer use during the migration fails loudly.
-    """
-    method = getattr(iterm2_manager, method_name)
-    with pytest.raises(NotImplementedError):
-        await method(*args)
+# All methods are now implemented; no remaining NotImplementedError stubs.
 
 
 # ----------------------------------------------------------------------
@@ -660,3 +643,303 @@ async def test_capture_pane_ansi_omits_redundant_codes_for_same_style() -> None:
     assert out is not None
     # Exactly one colour-change SGR before "A", then plain "B", then reset.
     assert out == "\x1b[32;49mAB\x1b[0m"
+
+
+# ----------------------------------------------------------------------
+# Unit 4: window lifecycle
+# ----------------------------------------------------------------------
+
+
+def _make_tab_with_session(session: MagicMock) -> MagicMock:
+    """Build a Tab whose current_session and sessions list reference ``session``."""
+    tab = MagicMock()
+    tab.current_session = session
+    tab.sessions = [session]
+    return tab
+
+
+def _make_window_for_create(new_session: MagicMock) -> MagicMock:
+    """Build a Window whose async_create_tab returns a tab containing ``new_session``."""
+    window = MagicMock()
+    window.tabs = []
+    new_tab = _make_tab_with_session(new_session)
+    window.async_create_tab = AsyncMock(return_value=new_tab)
+    return window
+
+
+async def test_rename_window_calls_async_set_name() -> None:
+    session = MagicMock()
+    session.async_set_name = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.rename_window("UUID", "newname")
+
+    assert ok is True
+    session.async_set_name.assert_awaited_once_with("newname")
+
+
+async def test_rename_window_returns_false_when_session_missing() -> None:
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_resolve_session", AsyncMock(return_value=None)):
+        ok = await mgr.rename_window("UUID-MISSING", "newname")
+    assert ok is False
+
+
+async def test_rename_window_returns_false_on_error() -> None:
+    session = MagicMock()
+    session.async_set_name = AsyncMock(side_effect=RuntimeError("boom"))
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.rename_window("UUID", "newname")
+    assert ok is False
+
+
+async def test_kill_window_force_closes_session() -> None:
+    session = MagicMock()
+    session.async_close = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with _bind_session(mgr, session):
+        ok = await mgr.kill_window("UUID")
+
+    assert ok is True
+    session.async_close.assert_awaited_once_with(force=True)
+
+
+async def test_kill_window_returns_false_when_session_missing() -> None:
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_resolve_session", AsyncMock(return_value=None)):
+        ok = await mgr.kill_window("UUID-MISSING")
+    assert ok is False
+
+
+async def test_create_window_rejects_missing_directory(tmp_path: Any) -> None:
+    mgr = _fresh_manager()
+    missing = tmp_path / "no-such-dir"
+    ok, msg, name, uuid = await mgr.create_window(str(missing))
+    assert ok is False
+    assert "does not exist" in msg
+    assert (name, uuid) == ("", "")
+
+
+async def test_create_window_rejects_non_directory(tmp_path: Any) -> None:
+    f = tmp_path / "afile"
+    f.write_text("x")
+    mgr = _fresh_manager()
+    ok, msg, name, uuid = await mgr.create_window(str(f))
+    assert ok is False
+    assert "Not a directory" in msg
+
+
+async def test_create_window_happy_path(tmp_path: Any) -> None:
+    """Open tab → tag with ccbot=1 → set name → send cd && exec claude."""
+    new_session = MagicMock()
+    new_session.session_id = "UUID-NEW"
+    sent: list[str] = []
+    new_session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+    new_session.async_set_variable = AsyncMock(return_value=None)
+    new_session.async_set_name = AsyncMock(return_value=None)
+
+    host_window = _make_window_for_create(new_session)
+    app = MagicMock()
+    app.windows = [host_window]
+    app.current_window = host_window
+    app.async_refresh = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with (
+        patch.object(mgr, "_get_app", AsyncMock(return_value=app)),
+        # No existing windows have ccbot tabs yet, so _get_target_window
+        # falls through to current_window.
+    ):
+        ok, msg, name, uuid = await mgr.create_window(str(tmp_path), window_name="proj")
+
+    assert ok is True
+    assert name == "proj"
+    assert uuid == "UUID-NEW"
+    new_session.async_set_variable.assert_awaited_once_with("user.ccbot", "1")
+    new_session.async_set_name.assert_awaited_once_with("proj")
+    # Boot command runs cd && exec claude in one shell line.
+    assert len(sent) == 1
+    assert "cd " in sent[0]
+    assert "exec claude" in sent[0]
+    assert sent[0].endswith("\n")
+
+
+async def test_create_window_with_resume_id(tmp_path: Any) -> None:
+    new_session = MagicMock()
+    new_session.session_id = "UUID-NEW"
+    sent: list[str] = []
+    new_session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+    new_session.async_set_variable = AsyncMock(return_value=None)
+    new_session.async_set_name = AsyncMock(return_value=None)
+
+    host_window = _make_window_for_create(new_session)
+    app = MagicMock()
+    app.windows = [host_window]
+    app.current_window = host_window
+    app.async_refresh = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        ok, _, _, _ = await mgr.create_window(
+            str(tmp_path), window_name="x", resume_session_id="abc-123"
+        )
+
+    assert ok is True
+    assert "--resume abc-123" in sent[0]
+
+
+async def test_create_window_without_claude_skips_exec(tmp_path: Any) -> None:
+    new_session = MagicMock()
+    new_session.session_id = "UUID-NEW"
+    sent: list[str] = []
+    new_session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+    new_session.async_set_variable = AsyncMock(return_value=None)
+    new_session.async_set_name = AsyncMock(return_value=None)
+
+    host_window = _make_window_for_create(new_session)
+    app = MagicMock()
+    app.windows = [host_window]
+    app.current_window = host_window
+    app.async_refresh = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        ok, _, _, _ = await mgr.create_window(
+            str(tmp_path), window_name="x", start_claude=False
+        )
+
+    assert ok is True
+    assert "exec claude" not in sent[0]
+    assert sent[0].startswith("cd ")
+
+
+async def test_create_window_dedupes_existing_name(tmp_path: Any) -> None:
+    """If a name is taken, the new tab gets a -2 suffix."""
+    existing = _make_session("UUID-X", tag="1", name="proj")
+    existing_tab = MagicMock()
+    existing_tab.sessions = [existing]
+    existing_window = MagicMock()
+    existing_window.tabs = [existing_tab]
+
+    new_session = MagicMock()
+    new_session.session_id = "UUID-NEW"
+    new_session.async_send_text = AsyncMock(return_value=None)
+    new_session.async_set_variable = AsyncMock(return_value=None)
+    new_session.async_set_name = AsyncMock(return_value=None)
+
+    new_tab = _make_tab_with_session(new_session)
+    existing_window.async_create_tab = AsyncMock(return_value=new_tab)
+
+    app = MagicMock()
+    app.windows = [existing_window]
+    app.current_window = existing_window
+    app.async_refresh = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        ok, _, name, _ = await mgr.create_window(str(tmp_path), window_name="proj")
+
+    assert ok is True
+    assert name == "proj-2"
+    new_session.async_set_name.assert_awaited_once_with("proj-2")
+
+
+async def test_create_window_quotes_paths_with_spaces(tmp_path: Any) -> None:
+    """Paths with spaces must be shlex-quoted to survive the cd command."""
+    spaced = tmp_path / "has spaces"
+    spaced.mkdir()
+
+    new_session = MagicMock()
+    new_session.session_id = "UUID-NEW"
+    sent: list[str] = []
+    new_session.async_send_text = AsyncMock(side_effect=lambda t: sent.append(t))
+    new_session.async_set_variable = AsyncMock(return_value=None)
+    new_session.async_set_name = AsyncMock(return_value=None)
+
+    host_window = _make_window_for_create(new_session)
+    app = MagicMock()
+    app.windows = [host_window]
+    app.current_window = host_window
+    app.async_refresh = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        ok, _, _, _ = await mgr.create_window(str(spaced), window_name="x")
+
+    assert ok is True
+    # The literal cd command must contain a quoted path so the shell
+    # parses it as one argument.
+    assert "'" in sent[0] or '"' in sent[0]
+    assert "has spaces" in sent[0]
+
+
+async def test_create_window_falls_back_to_default_profile(tmp_path: Any) -> None:
+    """If async_create_tab(profile=...) raises (e.g. profile missing),
+    we retry with no profile rather than failing the whole call."""
+    new_session = MagicMock()
+    new_session.session_id = "UUID-NEW"
+    new_session.async_send_text = AsyncMock(return_value=None)
+    new_session.async_set_variable = AsyncMock(return_value=None)
+    new_session.async_set_name = AsyncMock(return_value=None)
+    new_tab = _make_tab_with_session(new_session)
+
+    host_window = MagicMock()
+    host_window.tabs = []
+    create_calls: list[tuple[Any, ...]] = []
+
+    async def flaky_create_tab(
+        profile: str | None = None,
+        command: str | None = None,
+        index: int | None = None,
+        profile_customizations: Any = None,
+    ) -> Any:
+        create_calls.append((profile,))
+        if profile is not None:
+            raise RuntimeError("Unknown profile")
+        return new_tab
+
+    host_window.async_create_tab = flaky_create_tab
+
+    app = MagicMock()
+    app.windows = [host_window]
+    app.current_window = host_window
+    app.async_refresh = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        ok, _, _, _ = await mgr.create_window(str(tmp_path), window_name="x")
+
+    assert ok is True
+    # First attempt with profile name, then fallback with no profile.
+    assert len(create_calls) == 2
+    assert create_calls[0] == ("ccbot",)
+    assert create_calls[1] == (None,)
+
+
+async def test_get_target_window_prefers_existing_ccbot_window(tmp_path: Any) -> None:
+    """When some window already has ccbot tabs, new tabs go there
+    rather than into the user's foreground window."""
+    user_session = _make_session("UUID-USER", tag=None)
+    user_tab = MagicMock()
+    user_tab.sessions = [user_session]
+    user_window = MagicMock()
+    user_window.tabs = [user_tab]
+
+    ccbot_session = _make_session("UUID-CC", tag="1")
+    ccbot_tab = MagicMock()
+    ccbot_tab.sessions = [ccbot_session]
+    ccbot_window = MagicMock()
+    ccbot_window.tabs = [ccbot_tab]
+
+    app = MagicMock()
+    app.windows = [user_window, ccbot_window]
+    # current_window points at user_window — but the method should
+    # prefer ccbot_window because it already hosts ccbot tabs.
+    app.current_window = user_window
+
+    mgr = _fresh_manager()
+    target = await mgr._get_target_window(app)
+    assert target is ccbot_window
