@@ -20,10 +20,22 @@ Key class: ITerm2Manager (singleton instantiated as ``iterm2_manager``).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
+import iterm2
+
 logger = logging.getLogger(__name__)
+
+
+# Reconnect backoff (seconds). Three attempts before giving up.
+_RECONNECT_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+# Marker variable used to identify ccbot-owned sessions. Stored as the
+# iTerm2 user-variable ``user.ccbot``; value is the literal "1".
+_CCBOT_TAG_NAME = "user.ccbot"
+_CCBOT_TAG_VALUE = "1"
 
 
 @dataclass
@@ -60,39 +72,166 @@ class ITerm2Manager:
         from .config import config
 
         self.profile_name = profile_name or config.iterm2_profile_name
+        self._connection: iterm2.Connection | None = None
+        self._app: iterm2.App | None = None
+        # Lock ensures two concurrent callers don't open two connections.
+        self._connect_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    async def _get_connection(self) -> iterm2.Connection:
+        """Return a live iTerm2 connection, reconnecting if needed.
+
+        Raises:
+            ConnectionError: After exhausting the reconnect backoff.
+                Callers should treat this as fatal at startup and as a
+                transient at runtime (next call retries).
+        """
+        async with self._connect_lock:
+            if self._connection is not None:
+                return self._connection
+
+            last_err: BaseException | None = None
+            for attempt, delay in enumerate(_RECONNECT_DELAYS):
+                if attempt > 0:
+                    logger.debug(
+                        "Retrying iTerm2 connection in %.1fs (attempt %d)",
+                        delay,
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(delay)
+                try:
+                    conn = await iterm2.Connection.async_create()
+                    self._connection = conn
+                    self._app = None  # force re-fetch on next _get_app
+                    logger.info("Connected to iTerm2 Python API")
+                    return conn
+                except Exception as e:
+                    last_err = e
+                    logger.debug(
+                        "iTerm2 connection attempt %d failed: %s", attempt + 1, e
+                    )
+
+            raise ConnectionError(
+                "Cannot connect to iTerm2. Ensure iTerm2 is running and "
+                "the Python API is enabled (Preferences → General → "
+                "Magic → Enable Python API)."
+            ) from last_err
+
+    async def _get_app(self) -> iterm2.App:
+        """Return a refreshed App handle, reconnecting on disconnect."""
+        try:
+            conn = await self._get_connection()
+            if self._app is None:
+                app = await iterm2.async_get_app(conn)
+                if app is None:
+                    raise ConnectionError("iTerm2 returned no App instance")
+                self._app = app
+            await self._app.async_refresh()
+            return self._app
+        except (ConnectionError, OSError):
+            # Drop cached state so the next call retries from scratch.
+            self._connection = None
+            self._app = None
+            raise
+
+    def _invalidate_connection(self) -> None:
+        """Drop cached connection so the next call reconnects."""
+        self._connection = None
+        self._app = None
+
+    # ------------------------------------------------------------------
+    # Read-only discovery
+    # ------------------------------------------------------------------
 
     async def list_windows(self) -> list[ITermWindow]:
         """List ccbot-owned tabs (sessions tagged with ``user.ccbot=1``).
 
         Returns:
             One ``ITermWindow`` per tagged session. Empty if iTerm2 has
-            no ccbot tabs open.
+            no ccbot tabs open or the connection is down.
         """
-        raise NotImplementedError("Unit 2")
+        try:
+            app = await self._get_app()
+        except ConnectionError as e:
+            logger.warning("list_windows: iTerm2 unreachable: %s", e)
+            return []
+
+        results: list[ITermWindow] = []
+        for window in app.windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    info = await self._session_to_window(session)
+                    if info is not None:
+                        results.append(info)
+        return results
 
     async def find_window_by_name(self, window_name: str) -> ITermWindow | None:
-        """Find a ccbot-owned session by its display name.
-
-        Args:
-            window_name: The session name to match (set via
-                ``Session.async_set_name``).
-
-        Returns:
-            The matching ``ITermWindow``, or ``None`` if not found.
-        """
-        raise NotImplementedError("Unit 2")
+        """Find a ccbot-owned session by its display name."""
+        for w in await self.list_windows():
+            if w.window_name == window_name:
+                return w
+        logger.debug("Window not found by name: %s", window_name)
+        return None
 
     async def find_window_by_id(self, window_id: str) -> ITermWindow | None:
-        """Find a ccbot-owned session by its iTerm2 session UUID.
+        """Find a ccbot-owned session by its iTerm2 session UUID."""
+        try:
+            app = await self._get_app()
+        except ConnectionError as e:
+            logger.warning("find_window_by_id: iTerm2 unreachable: %s", e)
+            return None
 
-        Args:
-            window_id: iTerm2 session UUID (e.g.
-                ``9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB``).
+        session = app.get_session_by_id(window_id)
+        if session is None:
+            logger.debug("Window not found by id: %s", window_id)
+            return None
+        return await self._session_to_window(session)
 
-        Returns:
-            The matching ``ITermWindow``, or ``None`` if not found.
+    # ------------------------------------------------------------------
+    # Implementation helpers
+    # ------------------------------------------------------------------
+
+    async def _session_to_window(self, session: iterm2.Session) -> ITermWindow | None:
+        """Convert a Session to ITermWindow, or None if not ccbot-owned.
+
+        Filters out sessions without the ``user.ccbot=1`` tag so the
+        user's own iTerm2 tabs stay invisible to the bot.
         """
-        raise NotImplementedError("Unit 2")
+        try:
+            tag = await session.async_get_variable(_CCBOT_TAG_NAME)
+        except Exception as e:
+            logger.debug("Failed to read tag for session %s: %s", session.session_id, e)
+            return None
+        if str(tag) != _CCBOT_TAG_VALUE:
+            return None
+
+        # name / path / jobName are best-effort; missing values become "".
+        name = await self._get_var(session, "session.name") or ""
+        cwd = await self._get_var(session, "session.path") or ""
+        job = await self._get_var(session, "session.jobName") or ""
+
+        return ITermWindow(
+            window_id=session.session_id,
+            window_name=name,
+            cwd=cwd,
+            pane_current_command=job,
+        )
+
+    @staticmethod
+    async def _get_var(session: iterm2.Session, name: str) -> str:
+        """Read an iTerm2 session variable, returning "" on any error."""
+        try:
+            value = await session.async_get_variable(name)
+        except Exception:
+            return ""
+        return "" if value is None else str(value)
+
+    # ------------------------------------------------------------------
+    # Stubs for later units
+    # ------------------------------------------------------------------
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a session's screen.
@@ -139,26 +278,11 @@ class ITerm2Manager:
         raise NotImplementedError("Unit 3")
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
-        """Rename a ccbot-owned session.
-
-        Args:
-            window_id: iTerm2 session UUID.
-            new_name: New session name.
-
-        Returns:
-            True on success, False otherwise.
-        """
+        """Rename a ccbot-owned session."""
         raise NotImplementedError("Unit 4")
 
     async def kill_window(self, window_id: str) -> bool:
-        """Close a ccbot-owned session.
-
-        Args:
-            window_id: iTerm2 session UUID.
-
-        Returns:
-            True on success, False otherwise.
-        """
+        """Close a ccbot-owned session."""
         raise NotImplementedError("Unit 4")
 
     async def create_window(
@@ -168,26 +292,7 @@ class ITerm2Manager:
         start_claude: bool = True,
         resume_session_id: str | None = None,
     ) -> tuple[bool, str, str, str]:
-        """Create a new ccbot-owned tab and optionally start Claude Code.
-
-        Opens the tab inside the dedicated ccbot iTerm2 window (created
-        lazily on first call), tags it with ``user.ccbot=1``, names it,
-        ``cd``s into ``work_dir``, and (if ``start_claude``) launches
-        ``claude`` with optional ``--resume <id>``.
-
-        Args:
-            work_dir: Absolute path to the working directory.
-            window_name: Optional display name (defaults to the
-                directory's basename). Conflicts get ``-2``/``-3``
-                suffixes.
-            start_claude: Whether to launch ``claude`` after ``cd``.
-            resume_session_id: If set, append ``--resume <id>`` to the
-                claude command.
-
-        Returns:
-            Tuple of (success, message, final_window_name, session_uuid).
-            On failure, name and uuid are empty strings.
-        """
+        """Create a new ccbot-owned tab and optionally start Claude Code."""
         raise NotImplementedError("Unit 4")
 
 
