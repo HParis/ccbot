@@ -592,6 +592,9 @@ class SessionMonitor:
         """Background loop for checking session updates.
 
         Uses simple async polling with aiofiles for non-blocking I/O.
+        Consecutive errors back off exponentially (cap 60s) so a stuck
+        iTerm2 connection or any other transient failure doesn't
+        produce a 2s tight log-spam loop indefinitely.
         """
         logger.info("Session monitor started, polling every %ss", self.poll_interval)
 
@@ -603,6 +606,7 @@ class SessionMonitor:
         # Initialize last known session_map
         self._last_session_map = await self._load_current_session_map()
 
+        consecutive_errors = 0
         while self._running:
             try:
                 # Load hook-based session map updates
@@ -625,10 +629,38 @@ class SessionMonitor:
                         except Exception as e:
                             logger.error(f"Message callback error: {e}")
 
-            except Exception as e:
-                logger.error(f"Monitor loop error: {e}")
+                # Successful iteration — reset backoff.
+                if consecutive_errors:
+                    logger.info(
+                        "Monitor loop recovered after %d consecutive errors",
+                        consecutive_errors,
+                    )
+                    consecutive_errors = 0
 
-            await asyncio.sleep(self.poll_interval)
+                await asyncio.sleep(self.poll_interval)
+
+            except Exception as e:
+                consecutive_errors += 1
+                # Log full traceback only on the first few; otherwise
+                # rate-limit to avoid disk spam under sustained failures.
+                if consecutive_errors <= 3:
+                    logger.error(
+                        "Monitor loop error (#%d): %s",
+                        consecutive_errors,
+                        e,
+                        exc_info=True,
+                    )
+                elif consecutive_errors % 30 == 0:
+                    logger.error(
+                        "Monitor loop still failing (#%d): %s",
+                        consecutive_errors,
+                        e,
+                    )
+                # Exponential backoff: 2s, 4s, 8s, ... capped at 60s.
+                backoff = min(
+                    self.poll_interval * (2 ** (consecutive_errors - 1)), 60.0
+                )
+                await asyncio.sleep(backoff)
 
         logger.info("Session monitor stopped")
 

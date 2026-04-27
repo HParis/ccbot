@@ -22,13 +22,50 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 from asyncio import sleep as _sleep
 from dataclasses import dataclass
+from pathlib import Path
 
 import iterm2
 import iterm2.screen as iterm2_screen
 
 logger = logging.getLogger(__name__)
+
+
+# Cached main-screen height (logical points, Cocoa coords).  Used to
+# convert iTerm2 frame coordinates into ``screencapture -R`` rectangle
+# coordinates.  Cached because querying via osascript spawns a process.
+_main_screen_height_cache: float | None = None
+
+
+async def _main_screen_height() -> float | None:
+    """Return the main screen's height in logical points, cached.
+
+    Uses JavaScript-for-Automation to read ``NSScreen.mainScreen.frame``
+    so we don't add a PyObjC dependency.  Returns None on failure.
+    """
+    global _main_screen_height_cache
+    if _main_screen_height_cache is not None:
+        return _main_screen_height_cache
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript",
+            "-l",
+            "JavaScript",
+            "-e",
+            'ObjC.import("Cocoa"); $.NSScreen.mainScreen.frame.size.height',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        _main_screen_height_cache = float(stdout.decode("utf-8").strip())
+        return _main_screen_height_cache
+    except Exception as e:
+        logger.error("Failed to read main screen height: %s", e)
+        return None
 
 
 # Reconnect backoff (seconds). Three attempts before giving up.
@@ -145,7 +182,17 @@ class ITerm2Manager:
             ) from last_err
 
     async def _get_app(self) -> iterm2.App:
-        """Return a refreshed App handle, reconnecting on disconnect."""
+        """Return a refreshed App handle, reconnecting on disconnect.
+
+        Catches broadly because iTerm2's WebSocket layer raises
+        ``websockets.exceptions.ConnectionClosedError`` (subclass of
+        ``Exception``, NOT ``ConnectionError``) when iTerm2 quits or
+        the system sleeps.  If we only catch ``ConnectionError``, the
+        cached dead connection sticks around forever and every
+        subsequent call re-throws — observed in production after a
+        sleep/wake cycle.  Drop the cache on any failure here and let
+        the next call reconnect cleanly.
+        """
         try:
             conn = await self._get_connection()
             if self._app is None:
@@ -155,11 +202,16 @@ class ITerm2Manager:
                 self._app = app
             await self._app.async_refresh()
             return self._app
-        except (ConnectionError, OSError):
-            # Drop cached state so the next call retries from scratch.
+        except Exception as e:
             self._connection = None
             self._app = None
-            raise
+            # Re-raise as ConnectionError so callers can use one
+            # exception class for "iTerm2 unreachable" handling.
+            if isinstance(e, ConnectionError):
+                raise
+            raise ConnectionError(
+                f"Lost iTerm2 connection: {type(e).__name__}: {e}"
+            ) from e
 
     def _invalidate_connection(self) -> None:
         """Drop cached connection so the next call reconnects."""
@@ -265,6 +317,116 @@ class ITerm2Manager:
             logger.warning("iTerm2 unreachable: %s", e)
             return None
         return app.get_session_by_id(window_id)
+
+    async def screenshot_session(self, window_id: str) -> bytes | None:
+        """Capture a real pixel screenshot of the ccbot session's tab.
+
+        Brings the target tab to the front of its iTerm2 window (without
+        activating iTerm2 across apps), reads the window's frame, then
+        shells out to ``screencapture -R x,y,w,h`` to grab a PNG of
+        just that window region.  This is preferred over the
+        ANSI-rebuild-and-render path because it preserves Nerd Font
+        glyphs, emoji, ligatures, and any other rendering iTerm2 does.
+
+        Returns PNG bytes on success.  Returns None if:
+          - the session is gone
+          - macOS Screen Recording permission isn't granted to the
+            bot's executable (one-time grant in System Settings →
+            Privacy & Security → Screen Recording)
+          - the iTerm2 window is fully off-screen
+        """
+        try:
+            app = await self._get_app()
+        except ConnectionError as e:
+            logger.warning("screenshot_session: iTerm2 unreachable: %s", e)
+            return None
+
+        session = app.get_session_by_id(window_id)
+        if session is None:
+            logger.debug("screenshot_session: session not found: %s", window_id)
+            return None
+
+        # Locate the iTerm2 Window + Tab containing this session.
+        tab = window = None
+        for w in app.windows:
+            for t in w.tabs:
+                for s in t.sessions:
+                    if s.session_id == window_id:
+                        tab, window = t, w
+                        break
+                if tab is not None:
+                    break
+            if tab is not None:
+                break
+        if tab is None or window is None:
+            logger.debug("screenshot_session: tab/window not located for %s", window_id)
+            return None
+
+        # Bring the target tab to front of its iTerm2 window so the
+        # rectangle we capture actually shows it. order_window_front=True
+        # raises the iTerm2 window above other windows of the same app
+        # but does not switch app focus globally.
+        try:
+            await tab.async_select(order_window_front=True)
+        except Exception as e:
+            logger.debug("async_select failed (continuing anyway): %s", e)
+
+        try:
+            frame = await window.async_get_frame()
+        except Exception as e:
+            logger.error("Failed to read window frame: %s", e)
+            return None
+
+        screen_h = await _main_screen_height()
+        if screen_h is None:
+            logger.error("Could not determine main screen height")
+            return None
+
+        # Cocoa frame (origin at bottom-left of main screen) →
+        # screencapture rect (origin at top-left of main screen).
+        cocoa_x = float(frame.origin.x)
+        cocoa_y = float(frame.origin.y)
+        w_px = float(frame.size.width)
+        h_px = float(frame.size.height)
+        screen_y = screen_h - cocoa_y - h_px
+        rect = f"{int(cocoa_x)},{int(screen_y)},{int(w_px)},{int(h_px)}"
+
+        out_path = Path(tempfile.mkstemp(prefix="ccbot-shot-", suffix=".png")[1])
+        try:
+            # Absolute path: launchd's default PATH excludes /usr/sbin,
+            # so a bare "screencapture" lookup fails when ccbot is run
+            # as a LaunchAgent.  /usr/sbin/screencapture has been the
+            # canonical location since macOS 10.x.
+            proc = await asyncio.create_subprocess_exec(
+                "/usr/sbin/screencapture",
+                "-x",  # silent (no shutter sound)
+                "-o",  # exclude window shadow when in window mode (harmless for -R)
+                "-R",
+                rect,
+                "-t",
+                "png",
+                str(out_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.error(
+                    "screencapture failed (rc=%s): %s",
+                    proc.returncode,
+                    stderr.decode("utf-8", errors="replace").strip(),
+                )
+                return None
+            try:
+                return out_path.read_bytes()
+            except OSError as e:
+                logger.error("Failed to read screenshot tempfile: %s", e)
+                return None
+        finally:
+            try:
+                out_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a session's screen.
@@ -559,13 +721,18 @@ def _color_to_sgr(
 
     Returns a tuple of stringified parameters (so the caller can
     diff them between cells before joining with ``;``).
+
+    Note: iTerm2's ``CellStyle.Color`` exposes ``standard`` / ``rgb``
+    / ``alternate`` as properties that **raise** when the colour
+    isn't of that kind — it does not return None. Always probe via
+    the ``is_*`` boolean properties first.
     """
     default = ("39",) if is_fg else ("49",)
 
     if color is None:
         return default
 
-    if color.standard is not None:
+    if color.is_standard:
         n = int(color.standard)
         if n < 8:
             return (str((30 if is_fg else 40) + n),)
@@ -573,7 +740,7 @@ def _color_to_sgr(
             return (str((90 if is_fg else 100) + n - 8),)
         return ("38" if is_fg else "48", "5", str(n))
 
-    if color.rgb is not None:
+    if color.is_rgb:
         rgb = color.rgb
         return (
             "38" if is_fg else "48",

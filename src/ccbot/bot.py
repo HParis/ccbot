@@ -131,7 +131,6 @@ from .handlers.message_sender import (
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
-from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
@@ -238,12 +237,17 @@ async def screenshot_command(
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
 
-    text = await iterm2_manager.capture_pane(w.window_id, with_ansi=True)
-    if not text:
-        await safe_reply(update.message, "❌ Failed to capture pane content.")
+    png_bytes = await iterm2_manager.screenshot_session(w.window_id)
+    if png_bytes is None:
+        await safe_reply(
+            update.message,
+            "❌ Failed to capture screenshot.\n\n"
+            "If this is the first time, grant ccbot **Screen Recording** "
+            "permission in System Settings → Privacy & Security → "
+            "Screen Recording, then restart the bot.",
+        )
         return
 
-    png_bytes = await text_to_image(text, with_ansi=True)
     keyboard = _build_screenshot_keyboard(wid)
     await update.message.reply_document(
         document=io.BytesIO(png_bytes),
@@ -1573,12 +1577,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Window no longer exists", show_alert=True)
             return
 
-        text = await iterm2_manager.capture_pane(w.window_id, with_ansi=True)
-        if not text:
-            await query.answer("Failed to capture pane", show_alert=True)
+        png_bytes = await iterm2_manager.screenshot_session(w.window_id)
+        if png_bytes is None:
+            await query.answer(
+                "Screenshot failed. Grant Screen Recording permission to "
+                "ccbot, then restart.",
+                show_alert=True,
+            )
             return
 
-        png_bytes = await text_to_image(text, with_ansi=True)
         keyboard = _build_screenshot_keyboard(window_id)
         try:
             await query.edit_message_media(
@@ -1733,9 +1740,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Refresh screenshot after key press
         await asyncio.sleep(0.5)
-        text = await iterm2_manager.capture_pane(w.window_id, with_ansi=True)
-        if text:
-            png_bytes = await text_to_image(text, with_ansi=True)
+        png_bytes = await iterm2_manager.screenshot_session(w.window_id)
+        if png_bytes is not None:
             keyboard = _build_screenshot_keyboard(window_id)
             try:
                 await query.edit_message_media(

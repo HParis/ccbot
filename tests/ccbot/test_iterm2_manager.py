@@ -8,6 +8,7 @@ against an in-process fake iTerm2 app so no GUI is required.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -258,6 +259,61 @@ async def test_get_connection_raises_after_exhausting_retries(
             await mgr._get_connection()
 
 
+async def test_get_app_invalidates_on_websockets_close_error(monkeypatch: Any) -> None:
+    """Regression: after iTerm2 quits or the system sleeps, the
+    underlying websocket raises ``websockets.exceptions.ConnectionClosedError``
+    (a plain Exception, NOT ConnectionError).  ``_get_app`` must
+    invalidate the cached connection on ANY failure, not just
+    ConnectionError, so the next call reconnects from scratch.
+
+    Pre-fix symptom (observed in production): one sleep/wake cycle
+    burned the cached websocket, then every subsequent /screenshot,
+    every monitor poll, every /esc, every send_keys re-raised the
+    same dead-connection exception forever — bot deaf until restart.
+    """
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+
+    # Simulate websockets' actual exception class — subclass of
+    # Exception, not ConnectionError.
+    class FakeWebsocketsClosed(Exception):
+        pass
+
+    bad_app = MagicMock()
+    bad_app.async_refresh = AsyncMock(
+        side_effect=FakeWebsocketsClosed("no close frame received or sent")
+    )
+    good_app = MagicMock()
+    good_app.async_refresh = AsyncMock(return_value=None)
+
+    apps = iter([bad_app, good_app])
+    create_calls = {"n": 0}
+
+    async def stub_async_get_app(_conn: Any) -> Any:
+        return next(apps)
+
+    async def stub_create_conn() -> Any:
+        create_calls["n"] += 1
+        return MagicMock()
+
+    monkeypatch.setattr("iterm2.async_get_app", stub_async_get_app)
+    monkeypatch.setattr("iterm2.Connection.async_create", stub_create_conn)
+
+    mgr = _fresh_manager()
+
+    # First _get_app(): creates conn #1, async_get_app returns bad_app,
+    # async_refresh raises FakeWebsocketsClosed → must invalidate and
+    # surface as ConnectionError.
+    with pytest.raises(ConnectionError, match="Lost iTerm2 connection"):
+        await mgr._get_app()
+    assert mgr._connection is None
+    assert mgr._app is None
+
+    # Second _get_app(): re-creates conn #2, returns good_app cleanly.
+    app = await mgr._get_app()
+    assert app is good_app
+    assert create_calls["n"] == 2
+
+
 async def test_invalidate_connection_forces_reconnect() -> None:
     """After a transient runtime failure, callers can invalidate the
     cache and the next _get_connection call reconnects from scratch."""
@@ -490,14 +546,20 @@ def _style(
     fg_rgb: tuple[int, int, int] | None = None,
     bg_standard: int | None = None,
 ) -> MagicMock:
-    """Build a minimal CellStyle stand-in that exposes fg_color / bg_color."""
+    """Build a minimal CellStyle stand-in that mirrors iTerm2's
+    ``CellStyle.Color`` discriminator API: probe via ``is_standard``
+    / ``is_rgb`` / ``is_alternate``; the typed accessors raise when
+    the colour isn't of that kind."""
     style = MagicMock()
 
     def _color(standard: int | None, rgb: tuple[int, int, int] | None) -> Any:
         if standard is None and rgb is None:
             return None
         c = MagicMock()
-        c.standard = standard
+        c.is_standard = standard is not None
+        c.is_rgb = rgb is not None
+        c.is_alternate = False
+        c.standard = standard if standard is not None else None
         if rgb is not None:
             rgb_obj = MagicMock()
             rgb_obj.red, rgb_obj.green, rgb_obj.blue = rgb
@@ -596,6 +658,31 @@ async def test_capture_pane_ansi_round_trips_through_screenshot_parser() -> None
     assert text_to_fg["C"] == _ANSI_COLORS[6]
 
 
+def test_color_to_sgr_does_not_touch_typed_accessors_unless_matching() -> None:
+    """Regression: iTerm2's CellStyle.Color exposes ``standard`` /
+    ``rgb`` as properties that *raise* when the colour isn't of that
+    kind. The serializer must probe via ``is_*`` first; otherwise
+    the very first cell with a non-standard colour throws
+    ``ValueError("Not a standard color")`` and /screenshot dies."""
+    from unittest.mock import PropertyMock, patch
+
+    from ccbot.iterm2_manager import _color_to_sgr
+
+    color = MagicMock()
+    color.is_standard = False
+    color.is_rgb = True
+    color.is_alternate = False
+    rgb_obj = MagicMock()
+    rgb_obj.red, rgb_obj.green, rgb_obj.blue = (1, 2, 3)
+    color.rgb = rgb_obj
+
+    # Make ``.standard`` raise on access — as the real iTerm2 class does.
+    raising = PropertyMock(side_effect=ValueError("Not a standard color"))
+    with patch.object(type(color), "standard", raising, create=True):
+        sgr = _color_to_sgr(color, is_fg=True)
+    assert sgr == ("38", "2", "1", "2", "3")
+
+
 async def test_capture_pane_ansi_omits_redundant_codes_for_same_style() -> None:
     """When two adjacent cells share a style, the second cell must NOT
     re-emit the SGR codes — keeps the output compact and round-trips
@@ -612,6 +699,194 @@ async def test_capture_pane_ansi_omits_redundant_codes_for_same_style() -> None:
     assert out is not None
     # Exactly one colour-change SGR before "A", then plain "B", then reset.
     assert out == "\x1b[32;49mAB\x1b[0m"
+
+
+# ----------------------------------------------------------------------
+# screenshot_session: pixel capture via screencapture(1)
+# ----------------------------------------------------------------------
+
+
+def _make_app_with_session(
+    session_uuid: str,
+    frame_origin: tuple[float, float],
+    frame_size: tuple[float, float],
+) -> tuple[MagicMock, MagicMock, MagicMock]:
+    """Build an App graph with one window, one tab, one session."""
+    from iterm2.util import Frame, Point, Size
+
+    sess = MagicMock()
+    sess.session_id = session_uuid
+
+    tab = MagicMock()
+    tab.sessions = [sess]
+    tab.async_select = AsyncMock(return_value=None)
+
+    window = MagicMock()
+    window.tabs = [tab]
+    frame = Frame(Point(*frame_origin), Size(*frame_size))
+    window.async_get_frame = AsyncMock(return_value=frame)
+
+    app = MagicMock()
+    app.windows = [window]
+    app.async_refresh = AsyncMock(return_value=None)
+    app.get_session_by_id = MagicMock(
+        side_effect=lambda sid, include_buried=True: (
+            sess if sid == session_uuid else None
+        )
+    )
+    return app, window, tab
+
+
+async def test_screenshot_session_returns_png_bytes_on_success(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Happy path: tab gets selected, frame is converted to screen
+    coords, screencapture is invoked, the resulting file is returned."""
+    app, window, tab = _make_app_with_session(
+        "UUID-A", frame_origin=(100.0, 200.0), frame_size=(800.0, 600.0)
+    )
+
+    # Pretend main screen is 1080 logical points tall.
+    async def fake_screen_height() -> float:
+        return 1080.0
+
+    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", fake_screen_height)
+
+    captured_args: list[str] = []
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"fake-image-data"
+
+    async def fake_subprocess_exec(*args: str, **kwargs: Any) -> Any:
+        # Record the screencapture invocation.
+        captured_args.extend(args)
+        # Find the output path (last positional arg after -t png).
+        out_path = Path(args[-1])
+        out_path.write_bytes(fake_png)
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(
+        "ccbot.iterm2_manager.asyncio.create_subprocess_exec",
+        fake_subprocess_exec,
+    )
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        out = await mgr.screenshot_session("UUID-A")
+
+    assert out == fake_png
+    # Tab was selected and screencapture was called with -R rect.
+    tab.async_select.assert_awaited_once()
+    assert "screencapture" in captured_args[0]
+    assert "-R" in captured_args
+    rect_idx = captured_args.index("-R") + 1
+    rect = captured_args[rect_idx]
+    # Cocoa origin (100, 200), size (800, 600), screen height 1080
+    # screen_y = 1080 - 200 - 600 = 280
+    assert rect == "100,280,800,600"
+
+
+async def test_screenshot_session_returns_none_when_session_missing(
+    monkeypatch: Any,
+) -> None:
+    app = MagicMock()
+    app.windows = []
+    app.async_refresh = AsyncMock(return_value=None)
+    app.get_session_by_id = MagicMock(return_value=None)
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        out = await mgr.screenshot_session("UUID-MISSING")
+    assert out is None
+
+
+async def test_screenshot_session_returns_none_when_screencapture_fails(
+    monkeypatch: Any,
+) -> None:
+    """Most likely cause of a non-zero return: macOS Screen Recording
+    permission isn't granted to the bot's executable."""
+    app, window, tab = _make_app_with_session(
+        "UUID-A", frame_origin=(0.0, 0.0), frame_size=(100.0, 100.0)
+    )
+
+    async def fake_screen_height() -> float:
+        return 1080.0
+
+    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", fake_screen_height)
+
+    async def failing_subprocess_exec(*args: str, **kwargs: Any) -> Any:
+        proc = MagicMock()
+        proc.communicate = AsyncMock(
+            return_value=(b"", b"could not create image from rect")
+        )
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(
+        "ccbot.iterm2_manager.asyncio.create_subprocess_exec",
+        failing_subprocess_exec,
+    )
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        out = await mgr.screenshot_session("UUID-A")
+    assert out is None
+
+
+async def test_screenshot_session_returns_none_when_screen_height_unknown(
+    monkeypatch: Any,
+) -> None:
+    app, _, _ = _make_app_with_session(
+        "UUID-A", frame_origin=(0.0, 0.0), frame_size=(100.0, 100.0)
+    )
+
+    async def no_height() -> float | None:
+        return None
+
+    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", no_height)
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        out = await mgr.screenshot_session("UUID-A")
+    assert out is None
+
+
+async def test_screenshot_session_survives_failed_tab_select(
+    monkeypatch: Any,
+) -> None:
+    """If async_select() throws (e.g. iTerm2 racing window close),
+    the screenshot still proceeds with whatever the window currently
+    shows rather than aborting."""
+    app, window, tab = _make_app_with_session(
+        "UUID-A", frame_origin=(0.0, 0.0), frame_size=(100.0, 100.0)
+    )
+    tab.async_select = AsyncMock(side_effect=RuntimeError("race"))
+
+    async def fake_screen_height() -> float:
+        return 1080.0
+
+    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", fake_screen_height)
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"x"
+
+    async def fake_subprocess_exec(*args: str, **kwargs: Any) -> Any:
+        Path(args[-1]).write_bytes(fake_png)
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(
+        "ccbot.iterm2_manager.asyncio.create_subprocess_exec",
+        fake_subprocess_exec,
+    )
+
+    mgr = _fresh_manager()
+    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
+        out = await mgr.screenshot_session("UUID-A")
+    assert out == fake_png
 
 
 # ----------------------------------------------------------------------
