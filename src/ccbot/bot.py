@@ -2074,20 +2074,20 @@ def create_bot() -> Application:
     #
     # read_timeout / write_timeout cap how long a *single* request can block
     # a connection, preventing leaked connections from accumulating.
-    _request_kwargs = dict(
-        pool_timeout=10.0,  # wait up to 10s for a free connection
-        connect_timeout=10.0,  # TCP connect
-        read_timeout=15.0,  # read response (default 5s too tight for edits)
-        write_timeout=15.0,  # send request body
-    )
-
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .request(HTTPXRequest(**_request_kwargs))
+        .request(
+            HTTPXRequest(
+                pool_timeout=10.0,
+                connect_timeout=10.0,
+                read_timeout=15.0,
+                write_timeout=15.0,
+            )
+        )
         .get_updates_request(
             HTTPXRequest(pool_timeout=5.0, connect_timeout=10.0, read_timeout=15.0)
         )
