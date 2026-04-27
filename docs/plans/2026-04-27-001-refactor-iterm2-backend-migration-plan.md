@@ -1,7 +1,7 @@
 ---
 title: "refactor: Migrate ccbot terminal backend from tmux to iTerm2"
 type: refactor
-status: active
+status: completed
 date: 2026-04-27
 ---
 
