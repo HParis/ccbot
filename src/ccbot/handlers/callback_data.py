@@ -27,6 +27,8 @@ CB_DIR_PAGE = "db:page:"
 CB_WIN_BIND = "wb:sel:"  # wb:sel:<index>
 CB_WIN_NEW = "wb:new"  # proceed to directory browser
 CB_WIN_CANCEL = "wb:cancel"
+CB_WIN_PAGE = "wb:page:"  # wb:page:<page_index>
+CB_WIN_BIND_CONFIRM = "wb:bc:"  # wb:bc:<index>  — confirm bind for non-Claude tab
 
 # Screenshot
 CB_SCREENSHOT_REFRESH = "ss:ref:"

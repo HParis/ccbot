@@ -35,6 +35,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,7 @@ from .handlers.callback_data import (
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
+    CB_WIN_PAGE,
 )
 from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
@@ -95,7 +97,9 @@ from .handlers.directory_browser import (
     STATE_KEY,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
+    UNBOUND_WINDOWS_FULL_KEY,
     UNBOUND_WINDOWS_KEY,
+    WINDOW_PAGE_KEY,
     build_directory_browser,
     build_session_picker,
     build_window_picker,
@@ -888,33 +892,50 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
-        # Unbound topic — check for unbound windows first
-        all_windows = await iterm2_manager.list_windows()
+        # Unbound topic — try the iTerm2 tab picker first (covers both
+        # ccbot-tagged tabs that lost their topic and untagged tabs
+        # the user opened manually).  Fall back to the directory
+        # browser only when nothing adoptable is open.
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.window_name, w.cwd)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
+        known_claude_uuids = set(session_manager._load_session_map_by_window().keys())
+        all_sessions = await iterm2_manager.list_all_sessions(known_claude_uuids)
+        candidates = [s for s in all_sessions if s.window_id not in bound_ids]
         logger.debug(
-            "Window picker check: all=%s, bound=%s, unbound=%s",
-            [w.window_name for w in all_windows],
-            bound_ids,
-            [name for _, name, _ in unbound],
+            "Tab picker check: all=%d, bound=%d, candidates=%s",
+            len(all_sessions),
+            len(bound_ids),
+            [(s.window_name, s.has_claude) for s in candidates],
         )
 
-        if unbound:
-            # Show window picker
+        if candidates:
+            # Derive a useful display name per session: prefer the cwd
+            # basename so manually-opened tabs (whose iTerm2 session
+            # name defaults to the profile, often "Default") still
+            # show as "ccbot" / "main" / etc. in the picker.  Matches
+            # the name we lock when binding (CB_WIN_BIND below).
+            def _picker_label(name: str, cwd: str) -> str:
+                if cwd:
+                    base = Path(cwd).name
+                    if base:
+                        return base
+                return name or "(unnamed)"
+
+            window_tuples = [
+                (s.window_id, _picker_label(s.window_name, s.cwd), s.cwd, s.has_claude)
+                for s in candidates
+            ]
             logger.info(
-                "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
-                len(unbound),
+                "Unbound topic: showing tab picker (%d candidates, user=%d, thread=%d)",
+                len(candidates),
                 user.id,
                 thread_id,
             )
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
+            msg_text, keyboard, win_ids = build_window_picker(window_tuples, page=0)
             if context.user_data is not None:
                 context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
                 context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+                context.user_data[UNBOUND_WINDOWS_FULL_KEY] = window_tuples
+                context.user_data[WINDOW_PAGE_KEY] = 0
                 context.user_data["_pending_thread_id"] = thread_id
                 context.user_data["_pending_thread_text"] = text
             await safe_reply(update.message, msg_text, reply_markup=keyboard)
@@ -1457,7 +1478,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
-    # Window picker: bind existing window
+    # Window picker: page navigation
+    elif data.startswith(CB_WIN_PAGE):
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        try:
+            page = int(data[len(CB_WIN_PAGE) :])
+        except ValueError:
+            await query.answer("Invalid data")
+            return
+        full_list: list = (
+            context.user_data.get(UNBOUND_WINDOWS_FULL_KEY, [])
+            if context.user_data
+            else []
+        )
+        if not full_list:
+            await query.answer("Picker expired, send a new message", show_alert=True)
+            return
+        msg_text, keyboard, _ = build_window_picker(full_list, page=page)
+        if context.user_data is not None:
+            context.user_data[WINDOW_PAGE_KEY] = page
+        try:
+            await query.edit_message_text(msg_text, reply_markup=keyboard)
+        except Exception:
+            pass
+        await query.answer()
+
+    # Window picker: bind existing tab (tagged or untagged)
     elif data.startswith(CB_WIN_BIND):
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
@@ -1474,16 +1525,39 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         cached_windows: list[str] = (
             context.user_data.get(UNBOUND_WINDOWS_KEY, []) if context.user_data else []
         )
+        full_list: list = (
+            context.user_data.get(UNBOUND_WINDOWS_FULL_KEY, [])
+            if context.user_data
+            else []
+        )
         if idx < 0 or idx >= len(cached_windows):
             await query.answer("Window list changed, please retry", show_alert=True)
             return
         selected_wid = cached_windows[idx]
+        # Pull the matching tuple to know has_claude + cwd basename for naming.
+        entry = full_list[idx] if idx < len(full_list) else None
+        original_name = entry[1] if entry else selected_wid
+        cwd = entry[2] if entry else ""
+        has_claude = bool(entry[3]) if entry else False
 
-        # Verify window still exists
-        w = await iterm2_manager.find_window_by_id(selected_wid)
-        if not w:
-            display = session_manager.get_display_name(selected_wid)
-            await query.answer(f"Window '{display}' no longer exists", show_alert=True)
+        # Compute a sensible display name: prefer the cwd basename
+        # over iTerm2's auto-generated "host — path" string.  Falls
+        # back to the original session name if cwd is empty.
+        if cwd:
+            from pathlib import Path as _Path
+
+            display = _Path(cwd).name or original_name
+        else:
+            display = original_name
+
+        # Adopt the session: tag with user.ccbot=1 + lock its name.
+        # After this call find_window_by_id will see it.
+        ok = await iterm2_manager.bind_existing_session(selected_wid, display)
+        if not ok:
+            await query.answer(
+                f"Tab '{original_name}' is gone — refresh and retry",
+                show_alert=True,
+            )
             return
 
         thread_id = _get_thread_id(update)
@@ -1491,13 +1565,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Not in a topic", show_alert=True)
             return
 
-        display = w.window_name
         clear_window_picker_state(context.user_data)
         session_manager.bind_thread(
             user.id, thread_id, selected_wid, window_name=display
         )
 
-        # Rename the topic to match the window name
+        # Rename the topic to match the new tab name.
         resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
         try:
             await context.bot.edit_forum_topic(
@@ -1508,12 +1581,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception as e:
             logger.debug(f"Failed to rename topic: {e}")
 
-        await safe_edit(
-            query,
-            f"✅ Bound to window `{display}`",
-        )
+        # If session_map says Claude isn't here, double-check the tab's
+        # foreground command before typing `claude`. iTerm2 reports the
+        # job as "node-runtime" when Claude is running; if so, the
+        # session_map entry just wasn't recorded (e.g. the old cleanup
+        # bug wiped it) and typing `claude` would land as user input.
+        # Discover the session_id ourselves and adopt it instead.
+        if not has_claude:
+            tab = await iterm2_manager.find_window_by_id(selected_wid)
+            if tab is not None and tab.pane_current_command == "node-runtime":
+                claimed = await session_manager.claim_running_claude(selected_wid, cwd)
+                if claimed:
+                    has_claude = True
 
-        # Forward pending text if any
+        if not has_claude:
+            await iterm2_manager.send_keys(selected_wid, "claude")
+            await safe_edit(
+                query,
+                f"✅ Bound to tab `{display}` — starting Claude…",
+            )
+            # Wait for the hook to register the session before forwarding text.
+            await session_manager.wait_for_session_map_entry(selected_wid, timeout=10.0)
+        else:
+            await safe_edit(query, f"✅ Bound to tab `{display}`")
+
+        # Forward pending text if any.
         pending_text = (
             context.user_data.get("_pending_thread_text") if context.user_data else None
         )
@@ -1782,10 +1874,24 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
             # Mark interactive mode BEFORE sleeping so polling skips this window
             set_interactive_mode(user_id, wid, thread_id)
-            # Flush pending messages (e.g. plan content) before sending interactive UI
+            # Flush pending messages (e.g. plan content) before sending
+            # interactive UI so they appear in order. Cap the wait — the
+            # queue is shared across this user's windows, so when several
+            # Claude sessions are active concurrently it can be replenished
+            # faster than we drain. Without a cap, the picker blocks
+            # arbitrarily long and (worse) holds up session_monitor's
+            # callback loop, freezing every other session's forwarding.
             queue = get_message_queue(user_id)
             if queue:
-                await queue.join()
+                try:
+                    await asyncio.wait_for(queue.join(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "queue.join timed out before interactive UI for "
+                        "user=%d window=%s — proceeding with possible reorder",
+                        user_id,
+                        wid,
+                    )
             # Wait briefly for Claude Code to render the question UI
             await asyncio.sleep(0.3)
             handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
@@ -1873,8 +1979,12 @@ async def post_init(application: Application) -> None:
 
     await application.bot.set_my_commands(bot_commands)
 
-    # Re-resolve stale window IDs from persisted state against live iTerm2 tabs
+    # Re-resolve stale window IDs from persisted state against live iTerm2 tabs.
+    # Runs once now for startup, then again on every reconnect (iTerm2 hands
+    # out fresh session UUIDs after a restart, so cached bindings would
+    # otherwise route into a dead UUID until the bot itself restarts).
     await session_manager.resolve_stale_ids()
+    iterm2_manager.add_reconnect_listener(session_manager.resolve_stale_ids)
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
@@ -1939,35 +2049,26 @@ async def _restart_polling(updater: Any) -> bool:
         return False
 
 
-async def _reset_bot_request_pool(bot: Any) -> bool:
-    """Recycle the bot's main HTTP client to recover from pool exhaustion.
-
-    When the sending pool is stuck (all connections occupied), simply waiting
-    won't help — the connections are leaked.  Shutting down the underlying
-    httpx client forces all connections closed and re-initializing creates a
-    fresh pool.
-    """
-    try:
-        await bot.shutdown()
-        await bot.initialize()
-        logger.info("Bot request pool reset successfully")
-        return True
-    except Exception:
-        logger.exception("Failed to reset bot request pool")
-        return False
-
-
 async def _watch_polling_task(application: Application) -> None:
     """Watchdog that detects dead/stuck polling and exhausted sending pool.
 
-    Detects three failure modes:
+    Detects four failure modes:
     1. Polling task died (exception/cancelled) — checked via task.done()
     2. Polling task alive but stuck — checked via getWebhookInfo
        pending_update_count.  If Telegram reports pending updates for 2
        consecutive checks (30s), the polling loop is stuck and gets restarted.
     3. Sending pool exhausted — tested by making a lightweight getMe() call
-       through the bot's own pool.  If it times out for 2 consecutive checks,
-       the pool is recycled.
+       through the bot's own pool.  If it fails for 2 consecutive checks, the
+       updater is fully restarted (recycles the shared bot HTTP clients AND
+       restarts polling — a bare pool reset would leave polling on a dead
+       client, producing the "receives but can't send" wedge).
+    4. Wedged despite recovery — if the network is reachable (Check 2's
+       standalone probe succeeds) yet the bot's own pool keeps failing across
+       several restart attempts, soft recovery isn't taking.  Exit the process
+       so launchd (KeepAlive=true) respawns a clean one — the automated
+       equivalent of a manual restart, which is the only thing known to clear
+       this state.  We escalate ONLY when the network is up; during a genuine
+       outage a restart cannot help, so we wait it out instead of churning.
     """
     updater = application.updater
     if not updater:
@@ -1975,6 +2076,7 @@ async def _watch_polling_task(application: Application) -> None:
 
     consecutive_pending = 0
     consecutive_pool_failures = 0
+    consecutive_wedged = 0  # network reachable but bot's own pool failing
 
     while True:
         await asyncio.sleep(15)
@@ -2008,7 +2110,9 @@ async def _watch_polling_task(application: Application) -> None:
                 data = resp.json()
             pending = data.get("result", {}).get("pending_update_count", 0)
         except Exception:
-            # Network genuinely down — restart won't help
+            # Network genuinely down — restart won't help, and we must not
+            # escalate to a process restart (Check 4) over a dead link.
+            consecutive_wedged = 0
             continue
 
         if pending > 0:
@@ -2028,19 +2132,40 @@ async def _watch_polling_task(application: Application) -> None:
         # --- Check 3: sending pool exhausted ---
         # Probe the bot's OWN pool with a lightweight call.  If the pool
         # is stuck, this will raise PoolTimeout within pool_timeout seconds.
+        # We reached here past Check 2, so the network IS reachable — a failure
+        # now means the bot's own client/pool is wedged, not the link.
         try:
             await asyncio.wait_for(application.bot.get_me(), timeout=12.0)
             consecutive_pool_failures = 0
+            consecutive_wedged = 0
         except Exception:
             consecutive_pool_failures += 1
+            consecutive_wedged += 1
             if consecutive_pool_failures >= 2:
                 logger.critical(
                     "Bot request pool exhausted for %d consecutive checks, "
-                    "resetting...",
+                    "restarting updater (pool reset + polling)...",
                     consecutive_pool_failures,
                 )
-                if await _reset_bot_request_pool(application.bot):
+                # _restart_polling recycles the shared bot HTTP clients (the
+                # pool reset) AND restarts polling, so inbound updates keep
+                # flowing after the recycle closed the get_updates client.
+                if await _restart_polling(updater):
                     consecutive_pool_failures = 0
+
+            # --- Check 4: wedged despite recovery → hard restart ---
+            # Network is up (Check 2 passed) but our own pool still can't do a
+            # trivial getMe after repeated soft restarts.  Only a fresh process
+            # clears this; launchd respawns us via KeepAlive.
+            if consecutive_wedged >= 6:
+                logger.critical(
+                    "Bot wedged: network reachable but own pool failed for %d "
+                    "consecutive checks (~%ds) despite restarts; exiting for "
+                    "launchd to respawn a clean process.",
+                    consecutive_wedged,
+                    consecutive_wedged * 15,
+                )
+                os._exit(1)
 
 
 async def post_shutdown(application: Application) -> None:

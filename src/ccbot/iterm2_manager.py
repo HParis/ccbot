@@ -24,52 +24,40 @@ import asyncio
 import logging
 import tempfile
 from asyncio import sleep as _sleep
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import iterm2
 import iterm2.screen as iterm2_screen
 
+ReconnectListener = Callable[[], Awaitable[None]]
+
 logger = logging.getLogger(__name__)
 
 
-# Cached main-screen height (logical points, Cocoa coords).  Used to
-# convert iTerm2 frame coordinates into ``screencapture -R`` rectangle
-# coordinates.  Cached because querying via osascript spawns a process.
-_main_screen_height_cache: float | None = None
-
-
-async def _main_screen_height() -> float | None:
-    """Return the main screen's height in logical points, cached.
-
-    Uses JavaScript-for-Automation to read ``NSScreen.mainScreen.frame``
-    so we don't add a PyObjC dependency.  Returns None on failure.
-    """
-    global _main_screen_height_cache
-    if _main_screen_height_cache is not None:
-        return _main_screen_height_cache
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript",
-            "-l",
-            "JavaScript",
-            "-e",
-            'ObjC.import("Cocoa"); $.NSScreen.mainScreen.frame.size.height',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return None
-        _main_screen_height_cache = float(stdout.decode("utf-8").strip())
-        return _main_screen_height_cache
-    except Exception as e:
-        logger.error("Failed to read main screen height: %s", e)
-        return None
+# Screenshot pipeline.  ``screencapture -l <CGWindowID>`` is robust
+# across multi-display and Retina setups (no hand-rolled coordinate
+# math), but the iTerm2 Python API does not expose CGWindowID.  We
+# resolve it via an osascript that matches the session by ``unique ID``
+# (= iTerm2 session UUID), brings that tab to the front of its window
+# without ``activate`` (so app focus does not switch globally), and
+# returns ``id of w`` — that is the macOS CGWindowID.
+_SCREENCAPTURE_BIN = "/usr/sbin/screencapture"
+_OSASCRIPT_BIN = "/usr/bin/osascript"
+# Empirically, iTerm2 needs ~0.3-0.4s to repaint after a tab select
+# before the offscreen window buffer reflects the new tab's contents.
+_SCREENSHOT_REDRAW_DELAY = 0.4
 
 
 # Reconnect backoff (seconds). Three attempts before giving up.
-_RECONNECT_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+# First entry is "wait before attempt 1" — 0.0 means try immediately.
+_RECONNECT_DELAYS: tuple[float, ...] = (0.0, 1.0, 2.0, 4.0)
+
+# Wait pattern after auto-launching iTerm2 via ``open -a iTerm``.
+# iTerm2 needs a moment to start the WebSocket server; first attempt
+# is delayed 1.5s to give it a head start.
+_LAUNCH_DELAYS: tuple[float, ...] = (1.5, 2.0, 3.0, 5.0)
 
 # Marker variable used to identify ccbot-owned sessions. Stored as the
 # iTerm2 user-variable ``user.ccbot``; value is the literal "1".
@@ -101,16 +89,23 @@ _BASH_PREFIX_DELAY = 1.0
 
 @dataclass
 class ITermWindow:
-    """Information about a ccbot-owned iTerm2 tab/session.
+    """Information about an iTerm2 tab/session.
 
     Field names match the previous TmuxWindow dataclass so callers don't
     need to change. ``window_id`` carries the iTerm2 session UUID.
+
+    ``is_ccbot`` and ``has_claude`` are populated by ``list_all_sessions``
+    for the bind-existing-tab picker; the lifecycle methods
+    (``find_window_by_id`` etc.) leave them at their defaults because
+    they only return ccbot-owned sessions, where both are implicitly True.
     """
 
     window_id: str  # iTerm2 session UUID
     window_name: str  # iTerm2 session name (set via async_set_name)
     cwd: str  # session's current working directory (or "")
     pane_current_command: str = ""  # foreground job name (or "")
+    is_ccbot: bool = False  # tagged with user.ccbot=1
+    has_claude: bool = False  # session_map.json has an entry for this UUID
 
 
 class ITerm2Manager:
@@ -137,49 +132,317 @@ class ITerm2Manager:
         self._app: iterm2.App | None = None
         # Lock ensures two concurrent callers don't open two connections.
         self._connect_lock = asyncio.Lock()
+        # Circuit breaker: when the API has rejected us recently, stop
+        # opening fresh websockets for a while.  iTerm2 throttles
+        # clients that reconnect aggressively; without a breaker, the
+        # bot's polling loops (status 1s, monitor 2s, ...) thunder on
+        # iTerm2 and accelerate the failure into a permanent loop.
+        self._circuit_open_until: float = 0.0
+        self._consecutive_failures: int = 0
+        # Listeners fired after a *re*-connection (not the first ever).
+        # Used by upper layers to re-resolve stale UUIDs: when iTerm2
+        # quits and restarts every session UUID changes, so cached
+        # bindings in SessionManager must be re-mapped against live
+        # tabs.  Listeners are awaited in registration order and may
+        # not raise — exceptions are logged and swallowed so a buggy
+        # listener can't break the connect path.
+        self._reconnect_listeners: list[ReconnectListener] = []
+        self._ever_connected: bool = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
+    def add_reconnect_listener(self, callback: ReconnectListener) -> None:
+        """Register a coroutine to run after every iTerm2 reconnection.
+
+        The callback is NOT invoked for the first-ever connection — only
+        when an existing connection had to be re-established (e.g. iTerm2
+        was quit and relaunched). Use this to refresh state that depends
+        on iTerm2 session UUIDs, which change across iTerm2 restarts.
+        """
+        self._reconnect_listeners.append(callback)
+
+    async def _fire_reconnect_listeners(self) -> None:
+        for cb in self._reconnect_listeners:
+            try:
+                await cb()
+            except Exception as e:
+                logger.error("iTerm2 reconnect listener failed: %s", e)
+
+    async def _handle_fresh_connection(self) -> None:
+        """Run post-connect bookkeeping after _get_connection succeeds.
+
+        First-ever connect just flips the flag; later connects fire the
+        reconnect listeners so callers can re-resolve stale session UUIDs
+        (iTerm2 assigns new UUIDs to every tab after a restart, breaking
+        every cached binding).
+        """
+        if not self._ever_connected:
+            self._ever_connected = True
+            return
+        await self._fire_reconnect_listeners()
+
+    async def _try_connect_once(
+        self,
+    ) -> tuple[iterm2.Connection | None, Exception | None]:
+        """Attempt one ``Connection.async_create`` call.
+
+        Returns (conn, None) on success, (None, exc) on failure.
+        Caller decides whether to retry / launch iTerm2 / give up.
+        """
+        try:
+            conn = await iterm2.Connection.async_create()
+            return conn, None
+        except Exception as e:
+            return None, e
+
+    async def _try_connect_with_backoff(
+        self, delays: tuple[float, ...]
+    ) -> tuple[iterm2.Connection | None, Exception | None]:
+        """Run a sequence of connection attempts separated by sleeps.
+
+        ``delays[0]`` is applied BEFORE the first attempt (use 0.0
+        for "try immediately") so callers can tune the timing of an
+        initial wait (e.g. just after launching iTerm2).
+        """
+        last_err: Exception | None = None
+        for attempt, delay in enumerate(delays):
+            if delay > 0:
+                logger.debug(
+                    "iTerm2 connect: waiting %.1fs (attempt %d)",
+                    delay,
+                    attempt + 1,
+                )
+                await _sleep(delay)
+            conn, err = await self._try_connect_once()
+            if conn is not None:
+                return conn, None
+            last_err = err
+            logger.debug("iTerm2 connect attempt %d failed: %s", attempt + 1, err)
+        return None, last_err
+
+    async def _launch_iterm2(self) -> bool:
+        """Shell out to ``open -a iTerm`` to start iTerm2 in the
+        background.  Returns False if ``open`` itself fails (rare —
+        usually means /usr/bin/open is missing or iTerm2 isn't
+        installed under any known name)."""
+        for app_name in ("iTerm", "iTerm2"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "/usr/bin/open",
+                    "-a",
+                    app_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    logger.info("Launched iTerm2 via 'open -a %s'", app_name)
+                    return True
+                logger.debug(
+                    "open -a %s failed: %s",
+                    app_name,
+                    stderr.decode("utf-8", errors="replace").strip(),
+                )
+            except FileNotFoundError:
+                # /usr/bin/open missing — extremely unlikely on macOS
+                logger.error("/usr/bin/open not found; cannot auto-launch iTerm2")
+                return False
+            except Exception as e:
+                logger.debug("Failed to launch %s: %s", app_name, e)
+        return False
+
     async def _get_connection(self) -> iterm2.Connection:
         """Return a live iTerm2 connection, reconnecting if needed.
 
+        On first failure across the standard backoff, shells out to
+        ``open -a iTerm`` to launch iTerm2 in the background, then
+        retries.  The user no longer has to manually start iTerm2
+        before sending a message in Telegram — the bot resurrects
+        the dependency on demand.
+
+        Honours the circuit breaker: if recent attempts failed
+        repeatedly, raises immediately without touching iTerm2.
+
         Raises:
-            ConnectionError: After exhausting the reconnect backoff.
-                Callers should treat this as fatal at startup and as a
-                transient at runtime (next call retries).
+            ConnectionError: After both the initial backoff and the
+                post-launch retry have failed, or while the breaker
+                is open.  Likely causes: iTerm2 isn't installed, the
+                Python API is disabled, or Launch Services can't
+                find an "iTerm"/"iTerm2" app.
         """
+        # Fast-fail while breaker is open.  Many polling loops call
+        # this every second; without the breaker, every call opens a
+        # fresh websocket and iTerm2 throttles the whole bot into a
+        # permanent failure state.
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        if now < self._circuit_open_until:
+            wait = self._circuit_open_until - now
+            raise ConnectionError(
+                f"iTerm2 backoff: not retrying for {wait:.1f}s"
+                f" (after {self._consecutive_failures} consecutive failures)"
+            )
+
         async with self._connect_lock:
             if self._connection is not None:
                 return self._connection
 
-            last_err: BaseException | None = None
-            for attempt, delay in enumerate(_RECONNECT_DELAYS):
-                if attempt > 0:
-                    logger.debug(
-                        "Retrying iTerm2 connection in %.1fs (attempt %d)",
-                        delay,
-                        attempt + 1,
-                    )
-                    await _sleep(delay)
-                try:
-                    conn = await iterm2.Connection.async_create()
-                    self._connection = conn
-                    self._app = None  # force re-fetch on next _get_app
-                    logger.info("Connected to iTerm2 Python API")
-                    return conn
-                except Exception as e:
-                    last_err = e
-                    logger.debug(
-                        "iTerm2 connection attempt %d failed: %s", attempt + 1, e
-                    )
+            # Phase 1: assume iTerm2 is already running.  Standard
+            # backoff (1s / 2s / 4s) — fast path for the common case.
+            conn, err = await self._try_connect_with_backoff(_RECONNECT_DELAYS)
+            if conn is not None:
+                self._connection = conn
+                self._app = None
+                logger.info("Connected to iTerm2 Python API")
+                await self._handle_fresh_connection()
+                return conn
 
+            # Phase 2: probably not running — try to launch it.
+            logger.info(
+                "iTerm2 unreachable after %d attempts; launching via 'open -a iTerm'",
+                len(_RECONNECT_DELAYS),
+            )
+            launched = await self._launch_iterm2()
+            if not launched:
+                self._trip_breaker()
+                raise ConnectionError(
+                    "Cannot reach iTerm2 and could not launch it via "
+                    "'open -a iTerm'.  Make sure iTerm2 is installed and "
+                    "the Python API is enabled (Preferences → General → "
+                    "Magic → Enable Python API)."
+                ) from err
+
+            # Phase 3: iTerm2 takes a moment to start serving the API
+            # after launch.  Slightly longer waits than phase 1.
+            conn, err = await self._try_connect_with_backoff(_LAUNCH_DELAYS)
+            if conn is not None:
+                self._connection = conn
+                self._app = None
+                logger.info("Connected to iTerm2 Python API after auto-launch")
+                await self._handle_fresh_connection()
+                return conn
+
+            self._trip_breaker()
             raise ConnectionError(
-                "Cannot connect to iTerm2. Ensure iTerm2 is running and "
-                "the Python API is enabled (Preferences → General → "
-                "Magic → Enable Python API)."
-            ) from last_err
+                "iTerm2 launched but the Python API is still unreachable. "
+                "Verify Preferences → General → Magic → Enable Python API "
+                "is on, then retry."
+            ) from err
+
+    async def _close_connection(self, conn: iterm2.Connection | None) -> None:
+        """Close an iTerm2 Connection's underlying websocket, cancel
+        its dispatch task, and invalidate the cached auth cookie.
+
+        Three jobs done at once because they share the same trigger
+        ("the cached connection is dead, throw it away"):
+
+        1. Close the websocket: the iterm2 lib's Connection holds
+           the websocket + a background dispatcher task on its own
+           instance; dropping our reference doesn't tear them down.
+           Without explicit close, every reconnect leaves a phantom
+           client that iTerm2 counts against its throttle limit.
+
+        2. Cancel the dispatcher task: same reason.
+
+        3. Clear ``ITERM2_COOKIE`` / ``ITERM2_KEY`` from the env so
+           the next ``Connection.async_create`` re-runs AppleScript
+           to fetch a fresh cookie.  When iTerm2 quits and relaunches,
+           the cookie inherited from the old process is invalid.  The
+           lib only re-auths on HTTP 401, but iTerm2 closes the
+           websocket silently instead — so without this, every
+           reconnect succeeds at the handshake and then the first
+           RPC dies with ConnectionClosedError, in a permanent loop.
+        """
+        if conn is not None:
+            ws = getattr(conn, "websocket", None)
+            if ws is not None:
+                try:
+                    close = getattr(ws, "close", None)
+                    if close is not None:
+                        result = close()
+                        if asyncio.iscoroutine(result):
+                            await result
+                except Exception as e:
+                    logger.debug("Error closing iTerm2 websocket: %s", e)
+            future = getattr(conn, "_Connection__dispatch_forever_future", None)
+            if future is not None and not future.done():
+                future.cancel()
+            tasks = getattr(conn, "_Connection__tasks", None) or []
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+        # Clear cached auth so next connect re-runs AppleScript.
+        import os as _os
+
+        for var in ("ITERM2_COOKIE", "ITERM2_KEY"):
+            _os.environ.pop(var, None)
+
+        # CRITICAL: iterm2.app.App.instance is a MODULE-LEVEL singleton
+        # in the iterm2 library.  Once async_get_app() succeeds, the
+        # lib stores the App on App.instance and registers a disconnect
+        # callback to clear it.  But that callback only fires if the
+        # dispatcher task processes a clean disconnect — abrupt
+        # ConnectionClosedError doesn't always trigger it.  When iTerm2
+        # quits and relaunches, the bot's process ends up with a stale
+        # App.instance pointing at the old dead connection's session
+        # graph; every subsequent async_get_app() returns that stale
+        # App and async_refresh() against it fails forever.  Force-clear
+        # the singleton ourselves on every connection invalidation.
+        try:
+            import iterm2.app as _app_mod
+
+            _app_mod.invalidate_app()
+        except Exception as e:
+            logger.debug("Failed to invalidate App.instance: %s", e)
+
+    def is_reachable(self) -> bool:
+        """Cheap, side-effect-free check for whether iTerm2 is likely up.
+
+        Returns False while the circuit breaker is open (recent connect
+        attempts have failed). True doesn't guarantee the next call will
+        succeed, but False is a strong "definitely don't take destructive
+        action that assumes the absence of a tab means it was closed".
+
+        Polling loops use this before unbinding stale threads — without
+        the check, a transient WebSocket drop reads as "every tab is
+        gone" and the bot wipes every binding while iTerm2 is restarting.
+        """
+        if self._circuit_open_until <= 0:
+            return True
+        loop = asyncio.get_event_loop()
+        return loop.time() >= self._circuit_open_until
+
+    def _trip_breaker(self) -> None:
+        """Record a failed connection attempt and open the breaker.
+
+        Backoff schedule (in seconds, indexed by consecutive_failures):
+            1 →  2s,  2 →  5s,  3 → 15s,  4 → 30s,  5+ → 60s.
+        """
+        self._consecutive_failures += 1
+        delays = (2.0, 5.0, 15.0, 30.0, 60.0)
+        idx = min(self._consecutive_failures - 1, len(delays) - 1)
+        delay = delays[idx]
+        loop = asyncio.get_event_loop()
+        self._circuit_open_until = loop.time() + delay
+        if self._consecutive_failures <= 3:
+            logger.warning(
+                "iTerm2 connection failed (#%d); breaker open for %.0fs",
+                self._consecutive_failures,
+                delay,
+            )
+
+    def _reset_breaker(self) -> None:
+        """Clear the breaker after a successful operation."""
+        if self._consecutive_failures:
+            logger.info(
+                "iTerm2 connection healthy again after %d failures",
+                self._consecutive_failures,
+            )
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
 
     async def _get_app(self) -> iterm2.App:
         """Return a refreshed App handle, reconnecting on disconnect.
@@ -187,26 +450,42 @@ class ITerm2Manager:
         Catches broadly because iTerm2's WebSocket layer raises
         ``websockets.exceptions.ConnectionClosedError`` (subclass of
         ``Exception``, NOT ``ConnectionError``) when iTerm2 quits or
-        the system sleeps.  If we only catch ``ConnectionError``, the
-        cached dead connection sticks around forever and every
-        subsequent call re-throws — observed in production after a
-        sleep/wake cycle.  Drop the cache on any failure here and let
-        the next call reconnect cleanly.
+        the system sleeps.  Drop the cache on any failure here and
+        let the next call reconnect cleanly.
+
+        Failures of post-connect operations (async_get_app /
+        async_refresh) trip the circuit breaker so successive
+        polling-loop calls don't flood iTerm2 with reconnect attempts.
+        ``_get_connection`` failures are NOT re-tripped here — that
+        function already manages its own breaker timer.
         """
+        # Phase 1: get a connection.  If this fails, the breaker is
+        # either already open (and we just propagate) or the failure
+        # was inside _get_connection's launch path.  Either way,
+        # don't double-trip.
+        conn = await self._get_connection()
+
+        # Phase 2: query iTerm2.  Failures here are real (websocket
+        # alive but RPC didn't work, e.g. iTerm2 throttled us);
+        # trip the breaker so the next call backs off.
         try:
-            conn = await self._get_connection()
             if self._app is None:
                 app = await iterm2.async_get_app(conn)
                 if app is None:
                     raise ConnectionError("iTerm2 returned no App instance")
                 self._app = app
             await self._app.async_refresh()
+            self._reset_breaker()
             return self._app
         except Exception as e:
+            stale_conn = self._connection
             self._connection = None
             self._app = None
-            # Re-raise as ConnectionError so callers can use one
-            # exception class for "iTerm2 unreachable" handling.
+            # Close the stale websocket + cancel dispatch tasks so
+            # they don't accumulate as phantom clients on iTerm2's
+            # side and trigger its connection throttle.
+            await self._close_connection(stale_conn)
+            self._trip_breaker()
             if isinstance(e, ConnectionError):
                 raise
             raise ConnectionError(
@@ -251,6 +530,92 @@ class ITerm2Manager:
                 return w
         logger.debug("Window not found by name: %s", window_name)
         return None
+
+    async def list_all_sessions(
+        self, claude_session_uuids: set[str] | None = None
+    ) -> list[ITermWindow]:
+        """List **all** iTerm2 sessions, including ones the bot doesn't
+        own.  Powers the "bind existing tab" picker.
+
+        Each returned ITermWindow carries:
+          - ``is_ccbot``: True if the session has ``user.ccbot=1``
+          - ``has_claude``: True if ``window_id`` appears in
+            ``claude_session_uuids`` (the caller should pass the set
+            of UUIDs that have a session_map.json entry).  If the
+            argument is None, ``has_claude`` is left False — the
+            caller is responsible for the lookup.
+
+        Empty list when iTerm2 is unreachable (graceful degradation
+        consistent with ``list_windows``).
+        """
+        try:
+            app = await self._get_app()
+        except ConnectionError as e:
+            logger.warning("list_all_sessions: iTerm2 unreachable: %s", e)
+            return []
+
+        known = claude_session_uuids or set()
+        results: list[ITermWindow] = []
+        for window in app.windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    info = await self._session_full_info(session, known)
+                    results.append(info)
+        return results
+
+    async def _session_full_info(
+        self, session: iterm2.Session, known: set[str]
+    ) -> ITermWindow:
+        """Build an ITermWindow with is_ccbot / has_claude populated."""
+        try:
+            tag = await session.async_get_variable(_CCBOT_TAG_NAME)
+        except Exception:
+            tag = None
+        is_ccbot = str(tag) == _CCBOT_TAG_VALUE
+
+        name = await self._get_var(session, "session.name") or ""
+        cwd = await self._get_var(session, "session.path") or ""
+        job = await self._get_var(session, "session.jobName") or ""
+
+        return ITermWindow(
+            window_id=session.session_id,
+            window_name=name,
+            cwd=cwd,
+            pane_current_command=job,
+            is_ccbot=is_ccbot,
+            has_claude=session.session_id in known,
+        )
+
+    async def bind_existing_session(self, window_id: str, name: str) -> bool:
+        """Adopt an existing iTerm2 session into ccbot's pool.
+
+        Tags the session with ``user.ccbot=1`` and sets its display
+        name.  After this call, the session is visible to
+        ``list_windows`` / ``find_window_by_id`` and the rest of the
+        ccbot pipeline can drive it.
+
+        Returns True on success, False if the session is gone.
+        """
+        try:
+            app = await self._get_app()
+        except ConnectionError as e:
+            logger.warning("bind_existing_session: iTerm2 unreachable: %s", e)
+            return False
+
+        session = app.get_session_by_id(window_id)
+        if session is None:
+            logger.debug("bind_existing_session: session not found: %s", window_id)
+            return False
+
+        try:
+            await session.async_set_variable(_CCBOT_TAG_NAME, _CCBOT_TAG_VALUE)
+            await session.async_set_name(name)
+        except Exception as e:
+            logger.error("Failed to tag/name session %s: %s", window_id, e)
+            return False
+
+        logger.info("Bound existing iTerm2 session %s as '%s'", window_id, name)
+        return True
 
     async def find_window_by_id(self, window_id: str) -> ITermWindow | None:
         """Find a ccbot-owned session by its iTerm2 session UUID."""
@@ -321,88 +686,39 @@ class ITerm2Manager:
     async def screenshot_session(self, window_id: str) -> bytes | None:
         """Capture a real pixel screenshot of the ccbot session's tab.
 
-        Brings the target tab to the front of its iTerm2 window (without
-        activating iTerm2 across apps), reads the window's frame, then
-        shells out to ``screencapture -R x,y,w,h`` to grab a PNG of
-        just that window region.  This is preferred over the
-        ANSI-rebuild-and-render path because it preserves Nerd Font
-        glyphs, emoji, ligatures, and any other rendering iTerm2 does.
+        Pipeline:
+          1. ``osascript`` finds the iTerm2 window/tab whose session has
+             ``unique ID == window_id``, brings that tab to the front of
+             its window (no ``activate`` — global app focus stays put),
+             and returns the window's CGWindowID.
+          2. Brief sleep lets iTerm2 finish redrawing the now-frontmost
+             tab into its offscreen window buffer.
+          3. ``screencapture -l <CGWindowID>`` reads that buffer.  This
+             mode is robust across multi-display and Retina setups with
+             no coordinate math.
 
         Returns PNG bytes on success.  Returns None if:
-          - the session is gone
+          - the session is gone (osascript returns NOT_FOUND)
           - macOS Screen Recording permission isn't granted to the
-            bot's executable (one-time grant in System Settings →
-            Privacy & Security → Screen Recording)
-          - the iTerm2 window is fully off-screen
+            ccbot Python binary (one-time grant in System Settings →
+            Privacy & Security → Screen Recording).  LaunchAgent-spawned
+            processes never trigger the TCC prompt; you must add the
+            binary manually and reload the agent.
         """
-        try:
-            app = await self._get_app()
-        except ConnectionError as e:
-            logger.warning("screenshot_session: iTerm2 unreachable: %s", e)
+        cgwindowid = await self._get_iterm2_cgwindowid(window_id)
+        if cgwindowid is None:
             return None
 
-        session = app.get_session_by_id(window_id)
-        if session is None:
-            logger.debug("screenshot_session: session not found: %s", window_id)
-            return None
-
-        # Locate the iTerm2 Window + Tab containing this session.
-        tab = window = None
-        for w in app.windows:
-            for t in w.tabs:
-                for s in t.sessions:
-                    if s.session_id == window_id:
-                        tab, window = t, w
-                        break
-                if tab is not None:
-                    break
-            if tab is not None:
-                break
-        if tab is None or window is None:
-            logger.debug("screenshot_session: tab/window not located for %s", window_id)
-            return None
-
-        # Bring the target tab to front of its iTerm2 window so the
-        # rectangle we capture actually shows it. order_window_front=True
-        # raises the iTerm2 window above other windows of the same app
-        # but does not switch app focus globally.
-        try:
-            await tab.async_select(order_window_front=True)
-        except Exception as e:
-            logger.debug("async_select failed (continuing anyway): %s", e)
-
-        try:
-            frame = await window.async_get_frame()
-        except Exception as e:
-            logger.error("Failed to read window frame: %s", e)
-            return None
-
-        screen_h = await _main_screen_height()
-        if screen_h is None:
-            logger.error("Could not determine main screen height")
-            return None
-
-        # Cocoa frame (origin at bottom-left of main screen) →
-        # screencapture rect (origin at top-left of main screen).
-        cocoa_x = float(frame.origin.x)
-        cocoa_y = float(frame.origin.y)
-        w_px = float(frame.size.width)
-        h_px = float(frame.size.height)
-        screen_y = screen_h - cocoa_y - h_px
-        rect = f"{int(cocoa_x)},{int(screen_y)},{int(w_px)},{int(h_px)}"
+        await asyncio.sleep(_SCREENSHOT_REDRAW_DELAY)
 
         out_path = Path(tempfile.mkstemp(prefix="ccbot-shot-", suffix=".png")[1])
         try:
-            # Absolute path: launchd's default PATH excludes /usr/sbin,
-            # so a bare "screencapture" lookup fails when ccbot is run
-            # as a LaunchAgent.  /usr/sbin/screencapture has been the
-            # canonical location since macOS 10.x.
             proc = await asyncio.create_subprocess_exec(
-                "/usr/sbin/screencapture",
+                _SCREENCAPTURE_BIN,
                 "-x",  # silent (no shutter sound)
-                "-o",  # exclude window shadow when in window mode (harmless for -R)
-                "-R",
-                rect,
+                "-o",  # exclude window shadow
+                "-l",
+                str(cgwindowid),
                 "-t",
                 "png",
                 str(out_path),
@@ -427,6 +743,68 @@ class ITerm2Manager:
                 out_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    async def _get_iterm2_cgwindowid(self, session_uuid: str) -> int | None:
+        """Resolve a session UUID to its iTerm2 window's CGWindowID via
+        AppleScript, also bringing that tab to the front of its window.
+
+        Returns None if osascript can't be run, the iTerm2 lookup fails,
+        or no session matches the UUID.
+        """
+        # session UUIDs are hex + dashes, safe to interpolate; reject any
+        # other shape just in case the caller hands us garbage.
+        if not all(c.isalnum() or c == "-" for c in session_uuid):
+            logger.error("invalid session UUID for screenshot: %r", session_uuid)
+            return None
+
+        script = (
+            'tell application "iTerm2"\n'
+            "  repeat with w in windows\n"
+            "    repeat with t in tabs of w\n"
+            "      repeat with s in sessions of t\n"
+            f'        if unique ID of s is "{session_uuid}" then\n'
+            "          tell w to select t\n"
+            "          return id of w as string\n"
+            "        end if\n"
+            "      end repeat\n"
+            "    end repeat\n"
+            "  end repeat\n"
+            '  return "NOT_FOUND"\n'
+            "end tell\n"
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _OSASCRIPT_BIN,
+                "-e",
+                script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            logger.error("osascript not found at %s", _OSASCRIPT_BIN)
+            return None
+
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(
+                "osascript failed (rc=%s): %s",
+                proc.returncode,
+                stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return None
+
+        out = stdout.decode("utf-8", errors="replace").strip()
+        if out == "NOT_FOUND" or not out:
+            logger.debug(
+                "screenshot_session: no iTerm2 session matches %s", session_uuid
+            )
+            return None
+        try:
+            return int(out)
+        except ValueError:
+            logger.error("osascript returned non-numeric window id: %r", out)
+            return None
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a session's screen.

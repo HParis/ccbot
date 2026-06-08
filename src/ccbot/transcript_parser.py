@@ -15,9 +15,22 @@ import base64
 import difflib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
+
+# Telegram bot sendDocument hard limit is 50 MB; cap a bit lower for safety.
+_MAX_DISK_IMAGE_BYTES = 49 * 1024 * 1024
+
+_IMAGE_EXT_TO_MEDIA_TYPE = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +285,46 @@ class TranscriptParser:
                 logger.debug("Failed to decode base64 image in tool_result")
         return images if images else None
 
+    @staticmethod
+    def load_image_from_disk(file_path: str) -> tuple[str, bytes] | None:
+        """Read an image file from disk for high-fidelity forwarding.
+
+        Claude Code downsamples images before embedding them in the JSONL
+        transcript, so the base64 payload is much lower resolution than the
+        source. When we can identify the original file (e.g. the `Read` tool
+        was given an absolute path), reading it directly preserves full
+        pixels for the Telegram side.
+
+        Returns (media_type, raw_bytes) or None if the file is missing,
+        not an image, or larger than the Telegram document upload limit.
+        """
+        if not file_path:
+            return None
+        ext = os.path.splitext(file_path)[1].lower()
+        media_type = _IMAGE_EXT_TO_MEDIA_TYPE.get(ext)
+        if media_type is None:
+            return None
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            return None
+        if size <= 0 or size > _MAX_DISK_IMAGE_BYTES:
+            if size > _MAX_DISK_IMAGE_BYTES:
+                logger.info(
+                    "Skipping on-disk image %s (%d bytes > %d limit)",
+                    file_path,
+                    size,
+                    _MAX_DISK_IMAGE_BYTES,
+                )
+            return None
+        try:
+            with open(file_path, "rb") as f:
+                raw_bytes = f.read()
+        except OSError as e:
+            logger.debug("Failed to read on-disk image %s: %s", file_path, e)
+            return None
+        return media_type, raw_bytes
+
     @classmethod
     def parse_message(cls, data: dict) -> ParsedMessage | None:
         """Parse a message entry from the JSONL data.
@@ -525,10 +578,15 @@ class TranscriptParser:
                                     )
                                 )
                         if tool_id:
-                            # Store tool info for later tool_result formatting
-                            # Edit tool needs input_data to generate diff in tool_result stage
+                            # Store tool info for later tool_result formatting.
+                            # Edit needs input_data to generate a diff at
+                            # tool_result time; Read needs file_path so we can
+                            # swap the JSONL's downsampled image with the on-
+                            # disk original.
                             input_data = (
-                                inp if name in ("Edit", "NotebookEdit") else None
+                                inp
+                                if name in ("Edit", "NotebookEdit", "Read")
+                                else None
                             )
                             pending_tools[tool_id] = PendingToolInfo(
                                 summary=summary,
@@ -610,6 +668,20 @@ class TranscriptParser:
                             tool_summary = tool_info.summary
                             tool_name = tool_info.tool_name
                             tool_input_data = tool_info.input_data
+
+                        # If this was a Read of an image file, replace the
+                        # downsampled JSONL bytes with the on-disk original.
+                        if (
+                            tool_name == "Read"
+                            and result_images
+                            and len(result_images) == 1
+                            and isinstance(tool_input_data, dict)
+                        ):
+                            fp = tool_input_data.get("file_path")
+                            if isinstance(fp, str):
+                                original = cls.load_image_from_disk(fp)
+                                if original is not None:
+                                    result_images = [original]
 
                         if is_interrupted:
                             # Show interruption inline with tool summary

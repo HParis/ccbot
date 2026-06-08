@@ -360,8 +360,18 @@ class SessionManager:
             self._save_state()
             logger.info("Startup re-resolution complete")
 
-        # Clean up session_map.json: stale window IDs and old-format keys
-        await self._cleanup_stale_session_map_entries(live_ids)
+        # Clean up session_map.json: stale window IDs and old-format keys.
+        # The hook writes session_map for any iTerm2 tab running Claude,
+        # tagged-as-ccbot or not (e.g. before the user binds a tab via the
+        # picker). live_ids above only includes ccbot-tagged sessions, so
+        # passing it here would wrongly drop entries for untagged tabs that
+        # are alive — the next time the user binds that tab the cached
+        # session_id is gone, the picker thinks Claude isn't running, and
+        # `claude` gets typed into a tab that already has Claude open.
+        # Use the unfiltered live set instead.
+        all_live = await iterm2_manager.list_all_sessions()
+        all_live_ids = {w.window_id for w in all_live}
+        await self._cleanup_stale_session_map_entries(all_live_ids)
         await self._cleanup_old_format_session_map_keys()
 
     async def _cleanup_old_format_session_map_keys(self) -> None:
@@ -860,8 +870,95 @@ class SessionManager:
 
     # --- Tmux helpers ---
 
+    async def claim_running_claude(self, window_id: str, cwd: str) -> str | None:
+        """Adopt a Claude that's already running in an iTerm2 tab.
+
+        Used when the picker is about to bind a tab whose session_map
+        entry was wiped earlier (e.g. by the pre-fix cleanup bug) but
+        Claude is actually still running there. Without this, ccbot
+        would type `claude` into the live Claude — which is treated as
+        user input — and never recover the session_id needed by the
+        monitor, so responses never reach Telegram.
+
+        Discovers the active JSONL by scanning Claude's per-project
+        transcript directory for the most recently modified file. If
+        nothing fresh is found (e.g. JSONL hasn't been written yet),
+        returns None and lets the caller fall back to typing `claude`.
+        Returns the discovered session_id on success.
+        """
+        if not cwd:
+            return None
+        # Claude Code maps every cwd to a single dir under
+        # ~/.claude/projects by replacing '/', ' ', and '~' with '-'.
+        sanitized = re.sub(r"[/ ~]", "-", cwd)
+        project_dir = Path.home() / ".claude" / "projects" / sanitized
+        if not project_dir.is_dir():
+            return None
+        candidates: list[tuple[float, Path]] = []
+        for jsonl in project_dir.glob("*.jsonl"):
+            try:
+                mtime = jsonl.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, jsonl))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        _, jsonl = candidates[0]
+        # The filename stem IS the session_id Claude writes to its
+        # JSONL header — same UUID the hook would have reported.
+        session_id = jsonl.stem
+        if not _UUID_RE.match(session_id):
+            return None
+
+        # Atomic read-modify-write through the same lock the hook uses.
+        # We import fcntl lazily so this module stays import-safe on
+        # non-POSIX in case the bot is ever exercised outside macOS.
+        import fcntl
+
+        map_file = config.session_map_file
+        map_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = map_file.with_suffix(".lock")
+        try:
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    session_map: dict[str, dict[str, str]] = {}
+                    if map_file.exists():
+                        try:
+                            session_map = json.loads(map_file.read_text())
+                        except (json.JSONDecodeError, OSError):
+                            pass
+                    key = f"{_SESSION_MAP_PREFIX}{window_id}"
+                    session_map[key] = {
+                        "session_id": session_id,
+                        "cwd": cwd,
+                        "window_name": "",
+                    }
+                    atomic_write_json(map_file, session_map)
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+        except OSError as e:
+            logger.error("Failed to write session_map during claim: %s", e)
+            return None
+
+        logger.info(
+            "Claimed already-running Claude: window=%s session_id=%s (via JSONL discovery)",
+            window_id,
+            session_id,
+        )
+        return session_id
+
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
-        """Send text to a iTerm2 tab by ID."""
+        """Send text to a iTerm2 tab by ID.
+
+        On a UUID miss, tries a display-name lookup and migrates state in
+        place — iTerm2 reassigns session UUIDs after a restart, so the
+        cached one can be stale even though a tab with the same name is
+        still alive. The connection-level reconnect listener normally
+        beats us to this, but the fallback covers the gap between iTerm2
+        coming back up and the listener firing.
+        """
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",
@@ -870,12 +967,59 @@ class SessionManager:
             len(text),
         )
         window = await iterm2_manager.find_window_by_id(window_id)
-        if not window:
+        if window is None:
+            new_id = await self._migrate_stale_window_id(window_id)
+            if new_id and new_id != window_id:
+                window = await iterm2_manager.find_window_by_id(new_id)
+                if window is not None:
+                    window_id = new_id
+        if window is None:
             return False, "Window not found (may have been closed)"
         success = await iterm2_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"
+
+    async def _migrate_stale_window_id(self, old_id: str) -> str | None:
+        """Re-key state from a stale UUID to the live one with the same name.
+
+        Returns the new window_id, or None if no live tab matches the
+        display name we had recorded for old_id. Updates thread_bindings,
+        window_display_names, window_states, and user_window_offsets
+        atomically, then persists.
+        """
+        display = self.window_display_names.get(old_id)
+        if not display:
+            return None
+        window = await iterm2_manager.find_window_by_name(display)
+        if window is None:
+            return None
+        new_id = window.window_id
+        if new_id == old_id:
+            return new_id
+
+        for bindings in self.thread_bindings.values():
+            for tid, val in list(bindings.items()):
+                if val == old_id:
+                    bindings[tid] = new_id
+
+        self.window_display_names[new_id] = display
+        self.window_display_names.pop(old_id, None)
+
+        if old_id in self.window_states:
+            ws = self.window_states.pop(old_id)
+            ws.window_name = display
+            self.window_states[new_id] = ws
+
+        for offsets in self.user_window_offsets.values():
+            if old_id in offsets:
+                offsets[new_id] = offsets.pop(old_id)
+
+        self._save_state()
+        logger.info(
+            "Migrated stale window_id %s -> %s (name=%s)", old_id, new_id, display
+        )
+        return new_id
 
     # --- Message history ---
 

@@ -183,11 +183,24 @@ async def status_poll_loop(bot: Bot) -> None:
                 else:
                     consecutive_probe_failures = 0
 
+            # Skip cleanup entirely while iTerm2 is unreachable: a transient
+            # drop (user quits iTerm2, reboots, lid-close, etc.) would
+            # otherwise read as "every tab is gone" and wipe every
+            # thread binding before the reconnect lands seconds later.
+            iterm2_healthy = iterm2_manager.is_reachable()
+
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
+                    if not iterm2_healthy:
+                        continue
                     # Clean up stale bindings (window no longer exists)
                     w = await iterm2_manager.find_window_by_id(wid)
                     if not w:
+                        # Double-check after the call: if iTerm2 just
+                        # tripped the breaker, the None doesn't prove the
+                        # tab is gone — it just proves we couldn't ask.
+                        if not iterm2_manager.is_reachable():
+                            continue
                         display = session_manager.get_display_name(wid)
                         # Try auto-rebind: find unbound window with same name
                         all_windows = await iterm2_manager.list_windows()

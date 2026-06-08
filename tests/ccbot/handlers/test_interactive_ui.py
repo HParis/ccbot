@@ -72,6 +72,88 @@ class TestHandleInteractiveUI:
         assert call_kwargs.kwargs["reply_markup"] is not None
 
     @pytest.mark.asyncio
+    async def test_not_modified_edit_does_not_send_duplicate(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """When edit_message_text raises "Message is not modified" because
+        the polled pane is identical to the last render, we must treat it
+        as a no-op success — not as a reason to send a fresh duplicate.
+        Regression: previously every quiescent picker tick spawned a copy.
+        """
+        from telegram.error import BadRequest
+
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        # Seed an existing interactive message so we hit the edit path
+        _interactive_msgs[(1, 42)] = 777
+
+        mock_bot.edit_message_text = AsyncMock(
+            side_effect=BadRequest(
+                "Message is not modified: specified new message content "
+                "and reply markup are exactly the same as a current "
+                "content and reply markup of the message"
+            )
+        )
+
+        with (
+            patch("ccbot.handlers.interactive_ui.iterm2_manager") as mock_iterm,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+        ):
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+        assert result is True
+        mock_bot.edit_message_text.assert_called_once()
+        # The critical assertion: no fresh duplicate
+        mock_bot.send_message.assert_not_called()
+        # And the original message id stays registered
+        assert _interactive_msgs.get((1, 42)) == 777
+
+    @pytest.mark.asyncio
+    async def test_other_badrequest_falls_back_to_send_new(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """Genuine edit failures (e.g. message deleted) should still
+        trigger a fresh send so the picker doesn't disappear silently."""
+        from telegram.error import BadRequest
+
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        _interactive_msgs[(1, 42)] = 777
+        mock_bot.edit_message_text = AsyncMock(
+            side_effect=BadRequest("Message to edit not found")
+        )
+
+        with (
+            patch("ccbot.handlers.interactive_ui.iterm2_manager") as mock_iterm,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+        ):
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+        assert result is True
+        mock_bot.edit_message_text.assert_called_once()
+        mock_bot.send_message.assert_called_once()
+        assert _interactive_msgs.get((1, 42)) == 999
+
+    @pytest.mark.asyncio
     async def test_handle_no_ui_returns_false(self, mock_bot: AsyncMock):
         """Returns False when no interactive UI detected in pane."""
         window_id = "@5"

@@ -7,6 +7,7 @@ against an in-process fake iTerm2 app so no GUI is required.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from pathlib import Path
 from typing import Any
@@ -205,6 +206,92 @@ async def test_find_window_by_name_matches_via_list_windows() -> None:
     assert found.window_id == "UUID-B"
 
 
+async def test_list_all_sessions_includes_untagged_with_flags() -> None:
+    """list_all_sessions returns every iTerm2 session — tagged AND
+    untagged — with is_ccbot / has_claude populated. Powers the
+    bind-existing-tab picker."""
+    tagged_with_claude = _make_session(
+        "UUID-A", tag="1", name="proj-a", path="/tmp/a", job="node"
+    )
+    tagged_without_claude = _make_session(
+        "UUID-B", tag="1", name="proj-b", path="/tmp/b", job="zsh"
+    )
+    untagged_with_claude = _make_session(
+        "UUID-C", tag=None, name="adhoc", path="/tmp/c", job="node"
+    )
+    untagged_shell = _make_session(
+        "UUID-D", tag=None, name="bare", path="/tmp/d", job="zsh"
+    )
+    app = _make_app(
+        [
+            tagged_with_claude,
+            tagged_without_claude,
+            untagged_with_claude,
+            untagged_shell,
+        ]
+    )
+
+    mgr = _fresh_manager()
+    known_claude_uuids = {"UUID-A", "UUID-C"}
+    with (
+        patch.object(mgr, "_get_connection", AsyncMock(return_value=MagicMock())),
+        patch("iterm2.async_get_app", AsyncMock(return_value=app)),
+    ):
+        result = await mgr.list_all_sessions(known_claude_uuids)
+
+    assert len(result) == 4
+    by_uuid = {w.window_id: w for w in result}
+    assert by_uuid["UUID-A"].is_ccbot is True
+    assert by_uuid["UUID-A"].has_claude is True
+    assert by_uuid["UUID-B"].is_ccbot is True
+    assert by_uuid["UUID-B"].has_claude is False
+    assert by_uuid["UUID-C"].is_ccbot is False
+    assert by_uuid["UUID-C"].has_claude is True
+    assert by_uuid["UUID-D"].is_ccbot is False
+    assert by_uuid["UUID-D"].has_claude is False
+
+
+async def test_list_all_sessions_returns_empty_when_iterm2_unreachable() -> None:
+    mgr = _fresh_manager()
+    with patch.object(
+        mgr,
+        "_get_connection",
+        AsyncMock(side_effect=ConnectionError("iTerm2 down")),
+    ):
+        result = await mgr.list_all_sessions(set())
+    assert result == []
+
+
+async def test_bind_existing_session_tags_and_names() -> None:
+    """bind_existing_session sets user.ccbot=1 and the display name."""
+    untagged = _make_session("UUID-X", tag=None, name="user-shell")
+    untagged.async_set_variable = AsyncMock(return_value=None)
+    untagged.async_set_name = AsyncMock(return_value=None)
+    app = _make_app([untagged])
+
+    mgr = _fresh_manager()
+    with (
+        patch.object(mgr, "_get_connection", AsyncMock(return_value=MagicMock())),
+        patch("iterm2.async_get_app", AsyncMock(return_value=app)),
+    ):
+        ok = await mgr.bind_existing_session("UUID-X", "myproj")
+
+    assert ok is True
+    untagged.async_set_variable.assert_awaited_once_with("user.ccbot", "1")
+    untagged.async_set_name.assert_awaited_once_with("myproj")
+
+
+async def test_bind_existing_session_returns_false_when_session_gone() -> None:
+    app = _make_app([])
+    mgr = _fresh_manager()
+    with (
+        patch.object(mgr, "_get_connection", AsyncMock(return_value=MagicMock())),
+        patch("iterm2.async_get_app", AsyncMock(return_value=app)),
+    ):
+        ok = await mgr.bind_existing_session("UUID-MISSING", "x")
+    assert ok is False
+
+
 async def test_find_window_by_name_returns_none_for_unknown() -> None:
     app = _make_app([_make_session("UUID-A", tag="1", name="proj-a")])
 
@@ -219,7 +306,6 @@ async def test_find_window_by_name_returns_none_for_unknown() -> None:
 async def test_get_connection_retries_then_succeeds(monkeypatch: Any) -> None:
     """Transient connection failures retry; eventual success caches the
     connection and skips further reconnect attempts."""
-    # Speed up backoff so the test doesn't actually sleep 1+2 seconds.
     monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
 
     attempts = {"n": 0}
@@ -248,15 +334,158 @@ async def test_get_connection_retries_then_succeeds(monkeypatch: Any) -> None:
 async def test_get_connection_raises_after_exhausting_retries(
     monkeypatch: Any,
 ) -> None:
+    """When connecting fails AND the auto-launch path also can't get
+    iTerm2 up, surface a ConnectionError rather than retrying forever."""
     monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("ccbot.iterm2_manager._LAUNCH_DELAYS", (0.0, 0.0))
 
     async def always_fail() -> Any:
         raise OSError("iTerm2 missing")
 
     mgr = _fresh_manager()
-    with patch("iterm2.Connection.async_create", always_fail):
-        with pytest.raises(ConnectionError, match="iTerm2"):
+    # Pretend `open -a iTerm` worked but the WebSocket still won't come up.
+    with (
+        patch("iterm2.Connection.async_create", always_fail),
+        patch.object(mgr, "_launch_iterm2", AsyncMock(return_value=True)),
+    ):
+        with pytest.raises(ConnectionError, match="Python API"):
             await mgr._get_connection()
+
+
+async def test_get_connection_auto_launches_iterm2_on_failure(
+    monkeypatch: Any,
+) -> None:
+    """Phase 1 backoff exhausts → bot shells out 'open -a iTerm' →
+    phase 3 backoff finds the API server up.  Result: the user can
+    send a TG message even if iTerm2 was closed."""
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("ccbot.iterm2_manager._LAUNCH_DELAYS", (0.0, 0.0, 0.0))
+
+    real_conn = MagicMock(spec=[])
+    attempts = {"n": 0}
+
+    async def flaky_create() -> Any:
+        attempts["n"] += 1
+        # Phase-1 attempts (1-3) fail, then we expect a launch, then
+        # post-launch attempts (4+) succeed.
+        if attempts["n"] <= 3:
+            raise OSError("not running")
+        return real_conn
+
+    mgr = _fresh_manager()
+    launch_mock = AsyncMock(return_value=True)
+    with (
+        patch("iterm2.Connection.async_create", flaky_create),
+        patch.object(mgr, "_launch_iterm2", launch_mock),
+    ):
+        conn = await mgr._get_connection()
+
+    assert conn is real_conn
+    launch_mock.assert_awaited_once()
+    # Three failed phase-1 attempts plus one successful phase-3 attempt.
+    assert attempts["n"] == 4
+
+
+async def test_get_connection_raises_when_open_command_fails(
+    monkeypatch: Any,
+) -> None:
+    """``open -a iTerm`` itself failing (iTerm2 not installed at all)
+    surfaces a clear ConnectionError, not a hang or a retry storm."""
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+
+    async def always_fail() -> Any:
+        raise OSError("connection refused")
+
+    mgr = _fresh_manager()
+    with (
+        patch("iterm2.Connection.async_create", always_fail),
+        patch.object(mgr, "_launch_iterm2", AsyncMock(return_value=False)),
+    ):
+        with pytest.raises(ConnectionError, match="could not launch"):
+            await mgr._get_connection()
+
+
+async def test_circuit_breaker_short_circuits_after_failure(
+    monkeypatch: Any,
+) -> None:
+    """After a failure trips the breaker, subsequent calls raise
+    immediately without hitting iTerm2.  This protects iTerm2 from
+    the bot's polling loops thundering during a transient outage."""
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+
+    create_calls = {"n": 0}
+
+    async def always_fail() -> Any:
+        create_calls["n"] += 1
+        raise OSError("nope")
+
+    mgr = _fresh_manager()
+    with (
+        patch("iterm2.Connection.async_create", always_fail),
+        patch.object(mgr, "_launch_iterm2", AsyncMock(return_value=False)),
+    ):
+        # First call: retries exhausted, breaker trips.
+        with pytest.raises(ConnectionError):
+            await mgr._get_connection()
+        first_create_count = create_calls["n"]
+        assert first_create_count >= 1
+        assert mgr._consecutive_failures == 1
+
+        # Second call: breaker open → no new connect attempt at all.
+        with pytest.raises(ConnectionError, match="backoff"):
+            await mgr._get_connection()
+        assert create_calls["n"] == first_create_count
+
+
+async def test_circuit_breaker_resets_on_successful_get_app(
+    monkeypatch: Any,
+) -> None:
+    """A successful end-to-end _get_app clears the breaker so future
+    calls don't keep deferring."""
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+
+    real_conn = MagicMock()
+    real_app = MagicMock()
+    real_app.async_refresh = AsyncMock(return_value=None)
+
+    mgr = _fresh_manager()
+    # Pretend a previous failure tripped the breaker (already past
+    # the deadline, so it shouldn't block this call).
+    mgr._consecutive_failures = 2
+    mgr._circuit_open_until = 0.0  # already expired
+
+    with (
+        patch("iterm2.Connection.async_create", AsyncMock(return_value=real_conn)),
+        patch("iterm2.async_get_app", AsyncMock(return_value=real_app)),
+    ):
+        app = await mgr._get_app()
+
+    assert app is real_app
+    assert mgr._consecutive_failures == 0
+    assert mgr._circuit_open_until == 0.0
+
+
+async def test_circuit_breaker_does_not_double_trip_on_breaker_raise(
+    monkeypatch: Any,
+) -> None:
+    """When the breaker raises pre-emptively (without touching iTerm2),
+    _get_app must NOT trip the breaker again — that would push the
+    open-until timer further forward each call and the breaker would
+    never close."""
+    mgr = _fresh_manager()
+    mgr._consecutive_failures = 1
+    # Open breaker for a long time so it's surely still open at call.
+    loop = asyncio.get_event_loop()
+    mgr._circuit_open_until = loop.time() + 100.0
+    open_until_before = mgr._circuit_open_until
+    failures_before = mgr._consecutive_failures
+
+    with pytest.raises(ConnectionError, match="backoff"):
+        await mgr._get_app()
+
+    # The pre-emptive raise must not have advanced either counter.
+    assert mgr._consecutive_failures == failures_before
+    assert mgr._circuit_open_until == open_until_before
 
 
 async def test_get_app_invalidates_on_websockets_close_error(monkeypatch: Any) -> None:
@@ -272,6 +501,7 @@ async def test_get_app_invalidates_on_websockets_close_error(monkeypatch: Any) -
     same dead-connection exception forever — bot deaf until restart.
     """
     monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("ccbot.iterm2_manager._LAUNCH_DELAYS", (0.0, 0.0))
 
     # Simulate websockets' actual exception class — subclass of
     # Exception, not ConnectionError.
@@ -307,6 +537,13 @@ async def test_get_app_invalidates_on_websockets_close_error(monkeypatch: Any) -
         await mgr._get_app()
     assert mgr._connection is None
     assert mgr._app is None
+
+    # The first failure trips the breaker.  In production the bot
+    # would back off; in this test we simulate "enough time passed"
+    # by clearing it manually so we can assert the second call
+    # reconnects cleanly (the bug under test is about cache
+    # invalidation, not about the breaker timing).
+    mgr._reset_breaker()
 
     # Second _get_app(): re-creates conn #2, returns good_app cleanly.
     app = await mgr._get_app()
@@ -706,187 +943,120 @@ async def test_capture_pane_ansi_omits_redundant_codes_for_same_style() -> None:
 # ----------------------------------------------------------------------
 
 
-def _make_app_with_session(
-    session_uuid: str,
-    frame_origin: tuple[float, float],
-    frame_size: tuple[float, float],
-) -> tuple[MagicMock, MagicMock, MagicMock]:
-    """Build an App graph with one window, one tab, one session."""
-    from iterm2.util import Frame, Point, Size
+def _patch_subprocess(
+    monkeypatch: Any,
+    *,
+    osascript_stdout: bytes = b"7927\n",
+    osascript_returncode: int = 0,
+    osascript_raises: type[BaseException] | None = None,
+    screencapture_stderr: bytes = b"",
+    screencapture_returncode: int = 0,
+    png_payload: bytes | None = b"\x89PNG\r\n\x1a\nfake-image-data",
+) -> list[list[str]]:
+    """Stub out asyncio.create_subprocess_exec to dispatch by the binary
+    being invoked.  Returns a list that captures each call's argv."""
+    captured: list[list[str]] = []
 
-    sess = MagicMock()
-    sess.session_id = session_uuid
+    async def fake_exec(*args: str, **kwargs: Any) -> Any:
+        captured.append(list(args))
+        cmd = args[0]
+        proc = MagicMock()
+        if cmd.endswith("osascript"):
+            if osascript_raises is not None:
+                raise osascript_raises("simulated")
+            proc.communicate = AsyncMock(return_value=(osascript_stdout, b""))
+            proc.returncode = osascript_returncode
+            return proc
+        if cmd.endswith("screencapture"):
+            if png_payload is not None and screencapture_returncode == 0:
+                Path(args[-1]).write_bytes(png_payload)
+            proc.communicate = AsyncMock(return_value=(b"", screencapture_stderr))
+            proc.returncode = screencapture_returncode
+            return proc
+        raise AssertionError(f"unexpected subprocess: {args!r}")
 
-    tab = MagicMock()
-    tab.sessions = [sess]
-    tab.async_select = AsyncMock(return_value=None)
-
-    window = MagicMock()
-    window.tabs = [tab]
-    frame = Frame(Point(*frame_origin), Size(*frame_size))
-    window.async_get_frame = AsyncMock(return_value=frame)
-
-    app = MagicMock()
-    app.windows = [window]
-    app.async_refresh = AsyncMock(return_value=None)
-    app.get_session_by_id = MagicMock(
-        side_effect=lambda sid, include_buried=True: (
-            sess if sid == session_uuid else None
-        )
+    monkeypatch.setattr(
+        "ccbot.iterm2_manager.asyncio.create_subprocess_exec", fake_exec
     )
-    return app, window, tab
+    return captured
 
 
 async def test_screenshot_session_returns_png_bytes_on_success(
-    tmp_path: Any, monkeypatch: Any
+    monkeypatch: Any,
 ) -> None:
-    """Happy path: tab gets selected, frame is converted to screen
-    coords, screencapture is invoked, the resulting file is returned."""
-    app, window, tab = _make_app_with_session(
-        "UUID-A", frame_origin=(100.0, 200.0), frame_size=(800.0, 600.0)
-    )
-
-    # Pretend main screen is 1080 logical points tall.
-    async def fake_screen_height() -> float:
-        return 1080.0
-
-    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", fake_screen_height)
-
-    captured_args: list[str] = []
-    fake_png = b"\x89PNG\r\n\x1a\n" + b"fake-image-data"
-
-    async def fake_subprocess_exec(*args: str, **kwargs: Any) -> Any:
-        # Record the screencapture invocation.
-        captured_args.extend(args)
-        # Find the output path (last positional arg after -t png).
-        out_path = Path(args[-1])
-        out_path.write_bytes(fake_png)
-
-        proc = MagicMock()
-        proc.communicate = AsyncMock(return_value=(b"", b""))
-        proc.returncode = 0
-        return proc
-
-    monkeypatch.setattr(
-        "ccbot.iterm2_manager.asyncio.create_subprocess_exec",
-        fake_subprocess_exec,
+    """Happy path: osascript yields a CGWindowID, screencapture -l writes
+    a PNG, the bytes get returned."""
+    fake_png = b"\x89PNG\r\n\x1a\nfake-image-data"
+    captured = _patch_subprocess(
+        monkeypatch, osascript_stdout=b"7927\n", png_payload=fake_png
     )
 
     mgr = _fresh_manager()
-    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
-        out = await mgr.screenshot_session("UUID-A")
+    out = await mgr.screenshot_session("DEAD-BEEF-1234")
 
     assert out == fake_png
-    # Tab was selected and screencapture was called with -R rect.
-    tab.async_select.assert_awaited_once()
-    assert "screencapture" in captured_args[0]
-    assert "-R" in captured_args
-    rect_idx = captured_args.index("-R") + 1
-    rect = captured_args[rect_idx]
-    # Cocoa origin (100, 200), size (800, 600), screen height 1080
-    # screen_y = 1080 - 200 - 600 = 280
-    assert rect == "100,280,800,600"
+    # First call: osascript with -e <script-containing-the-uuid>
+    assert captured[0][0].endswith("osascript")
+    assert captured[0][1] == "-e"
+    assert "DEAD-BEEF-1234" in captured[0][2]
+    assert "unique ID of s" in captured[0][2]
+    # Second call: screencapture -l 7927 ... <out.png>
+    assert captured[1][0].endswith("screencapture")
+    assert "-l" in captured[1]
+    assert "7927" in captured[1]
+    assert captured[1][-1].endswith(".png")
 
 
 async def test_screenshot_session_returns_none_when_session_missing(
     monkeypatch: Any,
 ) -> None:
-    app = MagicMock()
-    app.windows = []
-    app.async_refresh = AsyncMock(return_value=None)
-    app.get_session_by_id = MagicMock(return_value=None)
+    """osascript returns NOT_FOUND when no session matches the UUID."""
+    captured = _patch_subprocess(monkeypatch, osascript_stdout=b"NOT_FOUND\n")
 
     mgr = _fresh_manager()
-    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
-        out = await mgr.screenshot_session("UUID-MISSING")
+    out = await mgr.screenshot_session("UUID-MISSING")
     assert out is None
+    # screencapture must not be invoked.
+    assert all(not c[0].endswith("screencapture") for c in captured)
+
+
+async def test_screenshot_session_rejects_invalid_uuid(monkeypatch: Any) -> None:
+    """A UUID with non-hex/dash characters is refused before osascript
+    runs, since it would be interpolated into the AppleScript."""
+    captured = _patch_subprocess(monkeypatch)
+
+    mgr = _fresh_manager()
+    out = await mgr.screenshot_session('"; do bad things; "')
+    assert out is None
+    assert captured == []
 
 
 async def test_screenshot_session_returns_none_when_screencapture_fails(
     monkeypatch: Any,
 ) -> None:
-    """Most likely cause of a non-zero return: macOS Screen Recording
-    permission isn't granted to the bot's executable."""
-    app, window, tab = _make_app_with_session(
-        "UUID-A", frame_origin=(0.0, 0.0), frame_size=(100.0, 100.0)
-    )
-
-    async def fake_screen_height() -> float:
-        return 1080.0
-
-    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", fake_screen_height)
-
-    async def failing_subprocess_exec(*args: str, **kwargs: Any) -> Any:
-        proc = MagicMock()
-        proc.communicate = AsyncMock(
-            return_value=(b"", b"could not create image from rect")
-        )
-        proc.returncode = 1
-        return proc
-
-    monkeypatch.setattr(
-        "ccbot.iterm2_manager.asyncio.create_subprocess_exec",
-        failing_subprocess_exec,
+    """screencapture rc=1 with 'could not create image' is the typical
+    signature of macOS Screen Recording permission being denied."""
+    _patch_subprocess(
+        monkeypatch,
+        osascript_stdout=b"7927\n",
+        screencapture_stderr=b"could not create image from window",
+        screencapture_returncode=1,
     )
 
     mgr = _fresh_manager()
-    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
-        out = await mgr.screenshot_session("UUID-A")
+    out = await mgr.screenshot_session("DEAD-BEEF-1234")
     assert out is None
 
 
-async def test_screenshot_session_returns_none_when_screen_height_unknown(
+async def test_screenshot_session_returns_none_when_osascript_missing(
     monkeypatch: Any,
 ) -> None:
-    app, _, _ = _make_app_with_session(
-        "UUID-A", frame_origin=(0.0, 0.0), frame_size=(100.0, 100.0)
-    )
-
-    async def no_height() -> float | None:
-        return None
-
-    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", no_height)
+    """If /usr/bin/osascript is absent we can't locate the window."""
+    _patch_subprocess(monkeypatch, osascript_raises=FileNotFoundError)
 
     mgr = _fresh_manager()
-    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
-        out = await mgr.screenshot_session("UUID-A")
+    out = await mgr.screenshot_session("DEAD-BEEF-1234")
     assert out is None
-
-
-async def test_screenshot_session_survives_failed_tab_select(
-    monkeypatch: Any,
-) -> None:
-    """If async_select() throws (e.g. iTerm2 racing window close),
-    the screenshot still proceeds with whatever the window currently
-    shows rather than aborting."""
-    app, window, tab = _make_app_with_session(
-        "UUID-A", frame_origin=(0.0, 0.0), frame_size=(100.0, 100.0)
-    )
-    tab.async_select = AsyncMock(side_effect=RuntimeError("race"))
-
-    async def fake_screen_height() -> float:
-        return 1080.0
-
-    monkeypatch.setattr("ccbot.iterm2_manager._main_screen_height", fake_screen_height)
-
-    fake_png = b"\x89PNG\r\n\x1a\n" + b"x"
-
-    async def fake_subprocess_exec(*args: str, **kwargs: Any) -> Any:
-        Path(args[-1]).write_bytes(fake_png)
-        proc = MagicMock()
-        proc.communicate = AsyncMock(return_value=(b"", b""))
-        proc.returncode = 0
-        return proc
-
-    monkeypatch.setattr(
-        "ccbot.iterm2_manager.asyncio.create_subprocess_exec",
-        fake_subprocess_exec,
-    )
-
-    mgr = _fresh_manager()
-    with patch.object(mgr, "_get_app", AsyncMock(return_value=app)):
-        out = await mgr.screenshot_session("UUID-A")
-    assert out == fake_png
 
 
 # ----------------------------------------------------------------------

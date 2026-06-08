@@ -17,6 +17,7 @@ State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 import logging
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
@@ -202,10 +203,26 @@ async def handle_interactive_ui(
             )
             _interactive_mode[ikey] = window_id
             return True
-        except Exception:
-            # Edit failed (message deleted, etc.) - clear stale msg_id and send new
+        except BadRequest as e:
+            # "Message is not modified" means the picker re-poll produced
+            # the same content + keyboard as last time — that's a no-op
+            # success, NOT a reason to send a duplicate. Without this
+            # branch, every quiescent picker tick spawns a fresh copy.
+            if "not modified" in str(e).lower():
+                _interactive_mode[ikey] = window_id
+                return True
             logger.debug(
-                "Edit failed for interactive msg %s, sending new", existing_msg_id
+                "Edit failed for interactive msg %s (%s), sending new",
+                existing_msg_id,
+                e,
+            )
+            _interactive_msgs.pop(ikey, None)
+            # Fall through to send new message
+        except Exception as e:
+            logger.debug(
+                "Edit failed for interactive msg %s (%s), sending new",
+                existing_msg_id,
+                e,
             )
             _interactive_msgs.pop(ikey, None)
             # Fall through to send new message

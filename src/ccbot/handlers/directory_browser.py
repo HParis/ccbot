@@ -1,13 +1,14 @@
 """Directory browser and window picker UI for session creation.
 
 Provides UIs in Telegram for:
-  - Window picker: list unbound iTerm2 tabs for quick binding
+  - Window picker: list unbound iTerm2 sessions (incl. user-opened
+    tabs that aren't yet ccbot-tagged) for quick adoption.
   - Directory browser: navigate directory hierarchies to create new sessions
 
 Key components:
-  - DIRS_PER_PAGE: Number of directories shown per page
+  - DIRS_PER_PAGE / WINDOWS_PER_PAGE: pagination sizes
   - User state keys for tracking browse/picker session
-  - build_window_picker: Build unbound window picker UI
+  - build_window_picker: Build candidate-session picker UI
   - build_directory_browser: Build directory browser UI
   - clear_window_picker_state: Clear picker state from user_data
   - clear_browse_state: Clear browsing state from user_data
@@ -34,10 +35,13 @@ from .callback_data import (
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
+    CB_WIN_PAGE,
 )
 
 # Directories per page in directory browser
 DIRS_PER_PAGE = 6
+# Sessions per page in tab picker
+WINDOWS_PER_PAGE = 6
 
 # User state keys
 STATE_KEY = "state"
@@ -46,7 +50,11 @@ STATE_SELECTING_WINDOW = "selecting_window"
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
 BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
-UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
+UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of window_id list (paginated)
+UNBOUND_WINDOWS_FULL_KEY = (
+    "unbound_windows_full"  # Full list of (wid, name, cwd, has_claude)
+)
+WINDOW_PAGE_KEY = "window_page"  # Current page in window picker
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
 
@@ -65,6 +73,8 @@ def clear_window_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(UNBOUND_WINDOWS_KEY, None)
+        user_data.pop(UNBOUND_WINDOWS_FULL_KEY, None)
+        user_data.pop(WINDOW_PAGE_KEY, None)
 
 
 def clear_session_picker_state(user_data: dict | None) -> None:
@@ -75,45 +85,81 @@ def clear_session_picker_state(user_data: dict | None) -> None:
 
 
 def build_window_picker(
-    windows: list[tuple[str, str, str]],
+    windows: list[tuple[str, str, str, bool]],
+    page: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
-    """Build window picker UI for unbound iTerm2 tabs.
+    """Build window picker UI for adoptable iTerm2 sessions.
 
     Args:
-        windows: List of (window_id, window_name, cwd) tuples.
+        windows: List of (window_id, display_name, cwd, has_claude)
+            tuples.  ``has_claude`` indicates whether session_map.json
+            already has an entry for this UUID (meaning Claude is
+            running in that tab); used to surface the running state
+            via emoji and to decide whether to send `claude\\n` after
+            binding.
+        page: Zero-based page index for pagination.
 
-    Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
+    Returns: (text, keyboard, window_ids) where window_ids is the
+    full ordered list of UUIDs (caller caches this so callbacks can
+    map button index → UUID even across page flips).
     """
-    window_ids = [wid for wid, _, _ in windows]
+    window_ids = [wid for wid, _, _, _ in windows]
+
+    total_pages = max(1, (len(windows) + WINDOWS_PER_PAGE - 1) // WINDOWS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * WINDOWS_PER_PAGE
+    page_windows = windows[start : start + WINDOWS_PER_PAGE]
 
     lines = [
-        "*Bind to Existing Window*\n",
-        "These windows are running but not bound to any topic.",
-        "Pick one to attach it here, or start a new session.\n",
+        "*Bind to Existing iTerm2 Tab*\n",
+        "Tabs detected in iTerm2 that aren't bound to a topic.",
+        "Pick one to adopt it, or browse for a directory to start fresh.",
+        "",
+        "🤖 = Claude already running   💻 = shell only",
+        "",
     ]
-    for _wid, name, cwd in windows:
-        display_cwd = cwd.replace(str(Path.home()), "~")
-        lines.append(f"• `{name}` — {display_cwd}")
+    for wid, name, cwd, has_claude in page_windows:
+        display_cwd = cwd.replace(str(Path.home()), "~") if cwd else "?"
+        prefix = "🤖" if has_claude else "💻"
+        lines.append(f"{prefix} `{name}` — {display_cwd}")
 
     buttons: list[list[InlineKeyboardButton]] = []
-    for i in range(0, len(windows), 2):
-        row = []
-        for j in range(min(2, len(windows) - i)):
-            name = windows[i + j][1]
-            display = name[:12] + "…" if len(name) > 13 else name
-            row.append(
+    # One button per row so the name + status icon both fit on phone.
+    for offset, (_wid, name, _cwd, has_claude) in enumerate(page_windows):
+        global_idx = start + offset
+        prefix = "🤖" if has_claude else "💻"
+        display = name[:30] + "…" if len(name) > 31 else name
+        buttons.append(
+            [
                 InlineKeyboardButton(
-                    f"🖥 {display}", callback_data=f"{CB_WIN_BIND}{i + j}"
+                    f"{prefix} {display}", callback_data=f"{CB_WIN_BIND}{global_idx}"
                 )
+            ]
+        )
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("◀", callback_data=f"{CB_WIN_PAGE}{page - 1}")
             )
-        buttons.append(row)
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+        )
+        if page < total_pages - 1:
+            nav.append(
+                InlineKeyboardButton("▶", callback_data=f"{CB_WIN_PAGE}{page + 1}")
+            )
+        buttons.append(nav)
 
     buttons.append(
         [
-            InlineKeyboardButton("➕ New Session", callback_data=CB_WIN_NEW),
-            InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL),
+            InlineKeyboardButton(
+                "📁 Browse directories instead", callback_data=CB_WIN_NEW
+            ),
         ]
     )
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL)])
 
     text = "\n".join(lines)
     return text, InlineKeyboardMarkup(buttons), window_ids
