@@ -154,6 +154,44 @@ class TestHandleInteractiveUI:
         assert _interactive_msgs.get((1, 42)) == 999
 
     @pytest.mark.asyncio
+    async def test_hard_edit_failure_deletes_old_message_after_new_send(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """On a genuine edit failure we send a replacement, then delete the
+        stale old message — but only AFTER the new one succeeds, so a failed
+        replacement never strands the user without controls."""
+        from telegram.error import BadRequest
+
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        _interactive_msgs[(1, 42)] = 777
+        mock_bot.edit_message_text = AsyncMock(
+            side_effect=BadRequest("Message to edit not found")
+        )
+
+        with (
+            patch("ccbot.handlers.interactive_ui.iterm2_manager") as mock_iterm,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+        ):
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+        assert result is True
+        mock_bot.send_message.assert_called_once()
+        # Old message deleted after the replacement landed.
+        mock_bot.delete_message.assert_called_once()
+        assert mock_bot.delete_message.call_args.kwargs["message_id"] == 777
+        assert _interactive_msgs.get((1, 42)) == 999
+
+    @pytest.mark.asyncio
     async def test_handle_no_ui_returns_false(self, mock_bot: AsyncMock):
         """Returns False when no interactive UI detected in pane."""
         window_id = "@5"

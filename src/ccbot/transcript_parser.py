@@ -397,7 +397,12 @@ class TranscriptParser:
         return f"{cls.EXPANDABLE_QUOTE_START}{text}{cls.EXPANDABLE_QUOTE_END}"
 
     @classmethod
-    def _format_tool_result_text(cls, text: str, tool_name: str | None = None) -> str:
+    def _format_tool_result_text(
+        cls,
+        text: str,
+        tool_name: str | None = None,
+        tool_input_data: dict | None = None,
+    ) -> str:
         """Format tool result text with statistics summary.
 
         Shows relevant statistics for each tool type, with expandable quote for full content.
@@ -416,9 +421,16 @@ class TranscriptParser:
             return f"  ⎿  Read {line_count} lines"
 
         elif tool_name == "Write":
-            # Write: show lines written
-            stats = f"  ⎿  Wrote {line_count} lines"
-            return stats
+            # Write: line count comes from the input content, not the result —
+            # the result is just a confirmation string ("File created at: ...").
+            written = tool_input_data.get("content", "") if tool_input_data else ""
+            if not written:
+                written_lines = 0
+            else:
+                written_lines = written.count("\n") + (
+                    0 if written.endswith("\n") else 1
+                )
+            return f"  ⎿  Wrote {written_lines} lines"
 
         elif tool_name == "Bash":
             # Bash: show output line count
@@ -585,7 +597,7 @@ class TranscriptParser:
                             # disk original.
                             input_data = (
                                 inp
-                                if name in ("Edit", "NotebookEdit", "Read")
+                                if name in ("Edit", "NotebookEdit", "Read", "Write")
                                 else None
                             )
                             pending_tools[tool_id] = PendingToolInfo(
@@ -763,7 +775,7 @@ class TranscriptParser:
                                 and cls.EXPANDABLE_QUOTE_START not in tool_summary
                             ):
                                 entry_text += "\n" + cls._format_tool_result_text(
-                                    result_text, tool_name
+                                    result_text, tool_name, tool_input_data
                                 )
                             result.append(
                                 ParsedEntry(
@@ -780,7 +792,7 @@ class TranscriptParser:
                                 ParsedEntry(
                                     role="assistant",
                                     text=cls._format_tool_result_text(
-                                        result_text, tool_name
+                                        result_text, tool_name, tool_input_data
                                     )
                                     if result_text
                                     else (tool_summary or ""),

@@ -102,3 +102,32 @@ class TestForwardCommand:
 
             mock_sm.send_to_window.assert_called_once_with("@5", "/clear")
             mock_sm.clear_window_session.assert_called_once_with("@5")
+
+    @pytest.mark.asyncio
+    async def test_send_action_timeout_does_not_drop_command(self):
+        """A flaky-network TimedOut on the cosmetic send_action(TYPING) must
+        NOT abort the handler before the command is injected — the update
+        offset has already advanced, so Telegram won't redeliver."""
+        from telegram.error import TimedOut
+
+        update = _make_update("/model")
+        update.message.chat.send_action = AsyncMock(side_effect=TimedOut())
+        context = _make_context()
+
+        with (
+            patch("ccbot.bot.is_user_allowed", return_value=True),
+            patch("ccbot.bot._get_thread_id", return_value=42),
+            patch("ccbot.bot.session_manager") as mock_sm,
+            patch("ccbot.bot.iterm2_manager") as mock_iterm,
+            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@5"
+            mock_sm.get_display_name.return_value = "project"
+            mock_iterm.find_window_by_id = AsyncMock(return_value=MagicMock())
+            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+
+            from ccbot.bot import forward_command_handler
+
+            await forward_command_handler(update, context)
+
+            mock_sm.send_to_window.assert_called_once_with("@5", "/model")

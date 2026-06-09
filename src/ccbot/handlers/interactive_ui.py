@@ -216,16 +216,16 @@ async def handle_interactive_ui(
                 existing_msg_id,
                 e,
             )
-            _interactive_msgs.pop(ikey, None)
-            # Fall through to send new message
+            # Keep existing_msg_id — delete it only after the replacement
+            # lands, so a failed replacement send never strands the user
+            # without controls.  Fall through to send new message.
         except Exception as e:
             logger.debug(
                 "Edit failed for interactive msg %s (%s), sending new",
                 existing_msg_id,
                 e,
             )
-            _interactive_msgs.pop(ikey, None)
-            # Fall through to send new message
+            # Fall through to send new message (old message kept until replaced)
 
     # Send new message (plain text — terminal content is not markdown)
     logger.info(
@@ -245,6 +245,12 @@ async def handle_interactive_ui(
     if sent:
         _interactive_msgs[ikey] = sent.message_id
         _interactive_mode[ikey] = window_id
+        # Replacement landed — now safe to remove the stale old message.
+        if existing_msg_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=existing_msg_id)
+            except Exception:
+                pass  # Old message may already be gone
         return True
     return False
 

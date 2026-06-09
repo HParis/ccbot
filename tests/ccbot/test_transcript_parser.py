@@ -264,11 +264,6 @@ class TestFormatToolResultText:
                 lambda r: r == "  ⎿  Read 3 lines",
             ),
             (
-                "line1\nline2",
-                "Write",
-                lambda r: r == "  ⎿  Wrote 2 lines",
-            ),
-            (
                 "output line",
                 "Bash",
                 lambda r: (
@@ -306,7 +301,7 @@ class TestFormatToolResultText:
                 lambda r: r == "",
             ),
         ],
-        ids=["Read", "Write", "Bash", "Grep", "Glob", "Task", "WebFetch", "empty"],
+        ids=["Read", "Bash", "Grep", "Glob", "Task", "WebFetch", "empty"],
     )
     def test_format_tool_result_text(self, text: str, tool_name: str, check):
         result = TranscriptParser._format_tool_result_text(text, tool_name)
@@ -508,3 +503,36 @@ class TestParseEntries:
         result, pending = TranscriptParser.parse_entries(entries)
         user_entries = [e for e in result if e.role == "user"]
         assert len(user_entries) == 0
+
+
+class TestFormatWriteLineCount:
+    """Write's tool_result text is just a confirmation string, so the line
+    count must come from the tool_use input content, not the result text."""
+
+    def test_write_counts_input_content_lines(self):
+        out = TranscriptParser._format_tool_result_text(
+            "File created successfully at: /tmp/x.py",
+            "Write",
+            {"content": "a\nb\nc"},
+        )
+        assert out == "  ⎿  Wrote 3 lines"
+
+    def test_write_trailing_newline_not_overcounted(self):
+        out = TranscriptParser._format_tool_result_text(
+            "File created successfully at: /tmp/x.py",
+            "Write",
+            {"content": "a\nb\nc\n"},
+        )
+        assert out == "  ⎿  Wrote 3 lines"
+
+    def test_write_empty_content_is_zero(self):
+        out = TranscriptParser._format_tool_result_text(
+            "File created successfully at: /tmp/x.py", "Write", {"content": ""}
+        )
+        assert out == "  ⎿  Wrote 0 lines"
+
+    def test_write_without_input_data_is_zero(self):
+        out = TranscriptParser._format_tool_result_text(
+            "File created successfully at: /tmp/x.py", "Write", None
+        )
+        assert out == "  ⎿  Wrote 0 lines"
