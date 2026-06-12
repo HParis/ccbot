@@ -110,6 +110,12 @@ class SessionManager:
     window_states: dict[str, WindowState] = field(default_factory=dict)
     user_window_offsets: dict[int, dict[str, int]] = field(default_factory=dict)
     thread_bindings: dict[int, dict[int, str]] = field(default_factory=dict)
+    # user_id -> {thread_id -> desired tab display name}.  Durable intent that
+    # OUTLIVES the volatile thread_bindings: when iTerm2/the machine restarts,
+    # every session UUID dies and the bindings get cleaned up, but the target
+    # name persists so rebind_unresolved() can re-attach each topic to a live
+    # tab of the same name.  Only cleared on explicit topic close.
+    thread_targets: dict[int, dict[int, str]] = field(default_factory=dict)
     # window_id -> display name (window_name)
     window_display_names: dict[str, str] = field(default_factory=dict)
     # "user_id:thread_id" -> group chat_id (for supergroup forum topic routing)
@@ -134,6 +140,10 @@ class SessionManager:
             "thread_bindings": {
                 str(uid): {str(tid): wid for tid, wid in bindings.items()}
                 for uid, bindings in self.thread_bindings.items()
+            },
+            "thread_targets": {
+                str(uid): {str(tid): name for tid, name in targets.items()}
+                for uid, targets in self.thread_targets.items()
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
@@ -177,6 +187,10 @@ class SessionManager:
                     int(uid): {int(tid): wid for tid, wid in bindings.items()}
                     for uid, bindings in state.get("thread_bindings", {}).items()
                 }
+                self.thread_targets = {
+                    int(uid): {int(tid): name for tid, name in targets.items()}
+                    for uid, targets in state.get("thread_targets", {}).items()
+                }
                 self.window_display_names = state.get("window_display_names", {})
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
@@ -209,6 +223,7 @@ class SessionManager:
                 self.window_states = {}
                 self.user_window_offsets = {}
                 self.thread_bindings = {}
+                self.thread_targets = {}
                 self.window_display_names = {}
                 self.group_chat_ids = {}
                 pass
@@ -776,8 +791,11 @@ class SessionManager:
         self.thread_bindings[user_id][thread_id] = window_id
         if window_name:
             self.window_display_names[window_id] = window_name
-        self._save_state()
         display = window_name or self.get_display_name(window_id)
+        # Record the durable target name so the topic can be auto-rebound to a
+        # same-named tab after an iTerm2/device restart changes the UUID.
+        self.thread_targets.setdefault(user_id, {})[thread_id] = display
+        self._save_state()
         logger.info(
             "Bound thread %d -> window_id %s (%s) for user %d",
             thread_id,
@@ -802,6 +820,75 @@ class SessionManager:
             user_id,
         )
         return window_id
+
+    def clear_thread_target(self, user_id: int, thread_id: int) -> None:
+        """Forget a topic's durable rebind target (on explicit topic close).
+
+        Unlike unbind_thread, this stops the topic from auto-rebinding to a
+        same-named tab on the next restart — used when the user closes/deletes
+        the Telegram topic, not when a tab merely went stale.
+        """
+        targets = self.thread_targets.get(user_id)
+        if not targets or thread_id not in targets:
+            return
+        targets.pop(thread_id, None)
+        if not targets:
+            del self.thread_targets[user_id]
+        self._save_state()
+
+    async def rebind_unresolved(self) -> int:
+        """Re-bind topics to live tabs by their durable display-name target.
+
+        After an iTerm2/device restart every session UUID dies and the volatile
+        thread_bindings get cleaned up, but thread_targets remembers the desired
+        tab name per topic.  This matches each unresolved target to a live,
+        unbound tab of the same name — only when EXACTLY ONE candidate exists,
+        mirroring the lazy auto-rebind elsewhere — so reboots don't require
+        manual re-binding.  Returns the number of topics rebound.
+        """
+        # Cheap pre-check: skip the iTerm2 round-trip when no targeted topic is
+        # currently without a binding.  (Bindings still pointing at a dead UUID
+        # are unbound by status polling first; next cycle they read as None.)
+        has_unresolved = any(
+            self.get_window_for_thread(uid, tid) is None
+            for uid, targets in self.thread_targets.items()
+            for tid in targets
+        )
+        if not has_unresolved:
+            return 0
+
+        windows = await iterm2_manager.list_windows()
+        live_ids = {w.window_id for w in windows}
+        bound_live = {
+            wid for _, _, wid in self.iter_thread_bindings() if wid in live_ids
+        }
+        claimed: set[str] = set()
+        count = 0
+        for uid, targets in self.thread_targets.items():
+            for tid, name in targets.items():
+                current = self.get_window_for_thread(uid, tid)
+                if current is not None and current in live_ids:
+                    continue  # already resolved to a live tab
+                candidates = [
+                    w
+                    for w in windows
+                    if w.window_name == name
+                    and w.window_id not in bound_live
+                    and w.window_id not in claimed
+                ]
+                if len(candidates) == 1:
+                    win = candidates[0]
+                    self.bind_thread(uid, tid, win.window_id, window_name=name)
+                    claimed.add(win.window_id)
+                    count += 1
+                    logger.info(
+                        "Auto-rebound topic by target: user=%d thread=%d -> %s (name=%s)",
+                        uid,
+                        tid,
+                        win.window_id,
+                        name,
+                    )
+        return count
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:
         """Look up the window_id bound to a thread."""

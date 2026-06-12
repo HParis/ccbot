@@ -573,3 +573,121 @@ class TestIsReachable:
         loop = asyncio.get_event_loop()
         mgr._circuit_open_until = loop.time() - 1.0
         assert mgr.is_reachable() is True
+
+
+class TestThreadTargets:
+    """Durable per-topic target names that survive reboots, enabling
+    auto-rebind when iTerm2 restarts and session UUIDs change."""
+
+    def test_bind_records_target(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
+        assert mgr.thread_targets[100][42] == "dev"
+
+    def test_bind_without_name_records_window_id_fallback(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_thread(100, 42, "UUID-1")
+        assert mgr.thread_targets[100][42] == "UUID-1"
+
+    def test_unbind_keeps_target(self, mgr: SessionManager) -> None:
+        """Stale cleanup (unbind) must NOT erase the durable target —
+        that's what lets a reboot auto-recover instead of losing the topic."""
+        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
+        mgr.unbind_thread(100, 42)
+        assert mgr.thread_targets[100][42] == "dev"
+
+    def test_clear_thread_target_removes(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
+        mgr.clear_thread_target(100, 42)
+        assert 42 not in mgr.thread_targets.get(100, {})
+
+    async def test_rebind_unresolved_binds_matching_tab(
+        self, mgr: SessionManager
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITermWindow
+
+        # Target persists but the binding was dropped on reboot.
+        mgr.thread_targets = {100: {42: "dev"}}
+        live = [
+            ITermWindow(
+                window_id="NEW-UUID",
+                window_name="dev",
+                cwd="/x",
+                pane_current_command="",
+            )
+        ]
+        with patch(
+            "ccbot.session.iterm2_manager.list_windows",
+            AsyncMock(return_value=live),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 1
+        assert mgr.get_window_for_thread(100, 42) == "NEW-UUID"
+
+    async def test_rebind_unresolved_skips_ambiguous(self, mgr: SessionManager) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITermWindow
+
+        mgr.thread_targets = {100: {42: "dev"}}
+        live = [
+            ITermWindow("U1", "dev", "/a", ""),
+            ITermWindow("U2", "dev", "/b", ""),
+        ]
+        with patch(
+            "ccbot.session.iterm2_manager.list_windows",
+            AsyncMock(return_value=live),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 0
+        assert mgr.get_window_for_thread(100, 42) is None
+        # Target kept for a later, unambiguous attempt.
+        assert mgr.thread_targets[100][42] == "dev"
+
+    async def test_rebind_unresolved_skips_already_live_binding(
+        self, mgr: SessionManager
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITermWindow
+
+        mgr.bind_thread(100, 42, "LIVE-UUID", window_name="dev")
+        live = [ITermWindow("LIVE-UUID", "dev", "/x", "")]
+        with patch(
+            "ccbot.session.iterm2_manager.list_windows",
+            AsyncMock(return_value=live),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 0
+        assert mgr.get_window_for_thread(100, 42) == "LIVE-UUID"
+
+    async def test_rebind_unresolved_no_targets_skips_network(
+        self, mgr: SessionManager
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        with patch("ccbot.session.iterm2_manager.list_windows", AsyncMock()) as m:
+            n = await mgr.rebind_unresolved()
+        assert n == 0
+        m.assert_not_called()
+
+    async def test_rebind_unresolved_does_not_steal_bound_tab(
+        self, mgr: SessionManager
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITermWindow
+
+        # thread 1 already holds the only "dev" tab; thread 2 also wants "dev".
+        mgr.bind_thread(100, 1, "U1", window_name="dev")
+        mgr.thread_targets.setdefault(100, {})[2] = "dev"
+        live = [ITermWindow("U1", "dev", "/x", "")]
+        with patch(
+            "ccbot.session.iterm2_manager.list_windows",
+            AsyncMock(return_value=live),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 0
+        assert mgr.get_window_for_thread(100, 2) is None

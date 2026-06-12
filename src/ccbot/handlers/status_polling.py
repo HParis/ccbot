@@ -156,6 +156,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             if w:
                                 await iterm2_manager.kill_window(w.window_id)
                             session_manager.unbind_thread(user_id, thread_id)
+                            # Topic genuinely gone — forget its rebind target.
+                            session_manager.clear_thread_target(user_id, thread_id)
                             await clear_topic_state(user_id, thread_id, bot)
                             logger.info(
                                 "Topic deleted: killed window_id '%s' and "
@@ -263,6 +265,16 @@ async def status_poll_loop(bot: Bot) -> None:
                         f"Status update error for user {user_id} "
                         f"thread {thread_id}: {e}"
                     )
+
+            # Auto-rebind topics whose target tab has (re)appeared — e.g. after a
+            # reboot the user reopens their Claude tabs while iTerm2 stays
+            # connected.  Cheap no-op when nothing is unresolved; skipped while
+            # iTerm2 is unreachable to avoid mass churn during a transient drop.
+            if iterm2_healthy:
+                try:
+                    await session_manager.rebind_unresolved()
+                except Exception as e:
+                    logger.debug("rebind_unresolved failed: %s", e)
         except Exception as e:
             logger.error(f"Status poll loop error: {e}")
 

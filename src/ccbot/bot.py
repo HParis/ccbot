@@ -454,6 +454,11 @@ async def topic_closed_handler(
             "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
         )
 
+    # Explicit close: forget the durable rebind target so this topic does NOT
+    # auto-rebind to a same-named tab on the next restart (unlike stale cleanup,
+    # which keeps it).
+    session_manager.clear_thread_target(user.id, thread_id)
+
 
 async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2006,12 +2011,20 @@ async def post_init(application: Application) -> None:
 
     await application.bot.set_my_commands(bot_commands)
 
-    # Re-resolve stale window IDs from persisted state against live iTerm2 tabs.
-    # Runs once now for startup, then again on every reconnect (iTerm2 hands
-    # out fresh session UUIDs after a restart, so cached bindings would
-    # otherwise route into a dead UUID until the bot itself restarts).
-    await session_manager.resolve_stale_ids()
-    iterm2_manager.add_reconnect_listener(session_manager.resolve_stale_ids)
+    # Re-resolve stale window IDs from persisted state against live iTerm2 tabs,
+    # then auto-rebind any topic whose binding was dropped (e.g. a device/iTerm2
+    # restart that wiped the volatile bindings) to a live tab matching its
+    # durable target name.  Runs once now for startup, then again on every
+    # reconnect (iTerm2 hands out fresh session UUIDs after a restart, so cached
+    # bindings would otherwise route into a dead UUID until the bot restarts).
+    async def _resolve_and_rebind() -> None:
+        await session_manager.resolve_stale_ids()
+        rebound = await session_manager.rebind_unresolved()
+        if rebound:
+            logger.info("Auto-rebound %d topic(s) to live tabs by target", rebound)
+
+    await _resolve_and_rebind()
+    iterm2_manager.add_reconnect_listener(_resolve_and_rebind)
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
