@@ -2019,6 +2019,7 @@ async def post_init(application: Application) -> None:
     # bindings would otherwise route into a dead UUID until the bot restarts).
     async def _resolve_and_rebind() -> None:
         await session_manager.resolve_stale_ids()
+        session_manager.refresh_thread_targets()
         rebound = await session_manager.rebind_unresolved()
         if rebound:
             logger.info("Auto-rebound %d topic(s) to live tabs by target", rebound)

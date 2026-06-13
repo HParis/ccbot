@@ -776,7 +776,12 @@ class SessionManager:
     # --- Thread binding management ---
 
     def bind_thread(
-        self, user_id: int, thread_id: int, window_id: str, window_name: str = ""
+        self,
+        user_id: int,
+        thread_id: int,
+        window_id: str,
+        window_name: str = "",
+        cwd: str | None = None,
     ) -> None:
         """Bind a Telegram topic thread to a iTerm2 tab.
 
@@ -785,6 +790,8 @@ class SessionManager:
             thread_id: Telegram topic thread ID
             window_id: iTerm2 session UUID
             window_name: Display name for the window (optional)
+            cwd: Working directory of the tab.  Recorded as the topic's durable
+                rebind target; falls back to the window's known WindowState cwd.
         """
         if user_id not in self.thread_bindings:
             self.thread_bindings[user_id] = {}
@@ -792,9 +799,16 @@ class SessionManager:
         if window_name:
             self.window_display_names[window_id] = window_name
         display = window_name or self.get_display_name(window_id)
-        # Record the durable target name so the topic can be auto-rebound to a
-        # same-named tab after an iTerm2/device restart changes the UUID.
-        self.thread_targets.setdefault(user_id, {})[thread_id] = display
+        # Record the durable target by CWD — stable across reboots, unlike the
+        # session UUID (regenerated) and the iTerm2 tab name (case/format may
+        # differ from our stored name).  rebind_unresolved() matches on it.
+        target_cwd = cwd
+        if not target_cwd:
+            ws = self.window_states.get(window_id)
+            if ws and ws.cwd:
+                target_cwd = ws.cwd
+        if target_cwd:
+            self.thread_targets.setdefault(user_id, {})[thread_id] = target_cwd
         self._save_state()
         logger.info(
             "Bound thread %d -> window_id %s (%s) for user %d",
@@ -836,15 +850,36 @@ class SessionManager:
             del self.thread_targets[user_id]
         self._save_state()
 
-    async def rebind_unresolved(self) -> int:
-        """Re-bind topics to live tabs by their durable display-name target.
+    def refresh_thread_targets(self) -> None:
+        """Backfill cwd targets for currently-bound threads from window_states.
 
-        After an iTerm2/device restart every session UUID dies and the volatile
-        thread_bindings get cleaned up, but thread_targets remembers the desired
-        tab name per topic.  This matches each unresolved target to a live,
-        unbound tab of the same name — only when EXACTLY ONE candidate exists,
-        mirroring the lazy auto-rebind elsewhere — so reboots don't require
-        manual re-binding.  Returns the number of topics rebound.
+        bind_thread records the cwd target when it's known, but on the create
+        flow the cwd may not be in window_states yet (the SessionStart hook is
+        async).  Calling this each healthy poll cycle guarantees every bound
+        topic ends up with a durable cwd target so a later reboot can rebind it.
+        """
+        changed = False
+        for uid, bindings in self.thread_bindings.items():
+            for tid, wid in bindings.items():
+                ws = self.window_states.get(wid)
+                if not ws or not ws.cwd:
+                    continue
+                if self.thread_targets.get(uid, {}).get(tid) != ws.cwd:
+                    self.thread_targets.setdefault(uid, {})[tid] = ws.cwd
+                    changed = True
+        if changed:
+            self._save_state()
+
+    async def rebind_unresolved(self) -> int:
+        """Re-bind topics to live tabs by their durable cwd target.
+
+        After an iTerm2/device restart every session UUID dies AND the
+        ``user.ccbot=1`` tag is lost (iTerm2 user variables don't persist), so
+        the restored tabs are untagged and invisible to list_windows.  We list
+        ALL sessions (tagged or not), match each unresolved topic to a session
+        whose cwd equals its target — only when EXACTLY ONE candidate exists, to
+        avoid grabbing the wrong tab — re-tag it (adopt) and bind.  Returns the
+        number of topics rebound.
         """
         # Cheap pre-check: skip the iTerm2 round-trip when no targeted topic is
         # currently without a binding.  (Bindings still pointing at a dead UUID
@@ -857,37 +892,47 @@ class SessionManager:
         if not has_unresolved:
             return 0
 
-        windows = await iterm2_manager.list_windows()
-        live_ids = {w.window_id for w in windows}
-        bound_live = {
-            wid for _, _, wid in self.iter_thread_bindings() if wid in live_ids
-        }
+        sessions = await iterm2_manager.list_all_sessions()
+        live_ids = {s.window_id for s in sessions}
+        bound = {wid for _, _, wid in self.iter_thread_bindings()}
         claimed: set[str] = set()
         count = 0
         for uid, targets in self.thread_targets.items():
-            for tid, name in targets.items():
+            for tid, target_cwd in targets.items():
                 current = self.get_window_for_thread(uid, tid)
                 if current is not None and current in live_ids:
-                    continue  # already resolved to a live tab
+                    continue  # already resolved to a live session
                 candidates = [
-                    w
-                    for w in windows
-                    if w.window_name == name
-                    and w.window_id not in bound_live
-                    and w.window_id not in claimed
+                    s
+                    for s in sessions
+                    if s.cwd == target_cwd
+                    and s.window_id not in bound
+                    and s.window_id not in claimed
                 ]
-                if len(candidates) == 1:
-                    win = candidates[0]
-                    self.bind_thread(uid, tid, win.window_id, window_name=name)
-                    claimed.add(win.window_id)
-                    count += 1
-                    logger.info(
-                        "Auto-rebound topic by target: user=%d thread=%d -> %s (name=%s)",
-                        uid,
-                        tid,
-                        win.window_id,
-                        name,
-                    )
+                if len(candidates) != 1:
+                    continue  # 0 = not open yet; >1 = ambiguous, wait it out
+                sess = candidates[0]
+                name = sess.window_name or Path(target_cwd).name
+                # Re-tag untagged (reboot-orphaned) tabs so the rest of the
+                # pipeline can drive them again; already-tagged ones skip this.
+                if not sess.is_ccbot:
+                    if not await iterm2_manager.bind_existing_session(
+                        sess.window_id, name
+                    ):
+                        continue
+                self.bind_thread(
+                    uid, tid, sess.window_id, window_name=name, cwd=target_cwd
+                )
+                claimed.add(sess.window_id)
+                bound.add(sess.window_id)
+                count += 1
+                logger.info(
+                    "Auto-rebound topic by cwd: user=%d thread=%d -> %s (cwd=%s)",
+                    uid,
+                    tid,
+                    sess.window_id,
+                    target_cwd,
+                )
         return count
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:

@@ -576,117 +576,146 @@ class TestIsReachable:
 
 
 class TestThreadTargets:
-    """Durable per-topic target names that survive reboots, enabling
-    auto-rebind when iTerm2 restarts and session UUIDs change."""
+    """Durable per-topic cwd targets that survive reboots, enabling auto-rebind
+    when iTerm2 restarts (session UUIDs change AND the user.ccbot tag is lost,
+    so the restored tabs are untagged and must be matched by cwd + re-tagged)."""
 
-    def test_bind_records_target(self, mgr: SessionManager) -> None:
-        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
-        assert mgr.thread_targets[100][42] == "dev"
+    def test_bind_records_cwd_target_from_param(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "UUID-1", window_name="dev", cwd="/p/dev")
+        assert mgr.thread_targets[100][42] == "/p/dev"
 
-    def test_bind_without_name_records_window_id_fallback(
+    def test_bind_records_cwd_target_from_window_state(
         self, mgr: SessionManager
     ) -> None:
-        mgr.bind_thread(100, 42, "UUID-1")
-        assert mgr.thread_targets[100][42] == "UUID-1"
+        from ccbot.session import WindowState
+
+        mgr.window_states["UUID-1"] = WindowState(window_name="dev", cwd="/p/dev")
+        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
+        assert mgr.thread_targets[100][42] == "/p/dev"
+
+    def test_bind_without_cwd_records_no_target(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
+        assert 42 not in mgr.thread_targets.get(100, {})
 
     def test_unbind_keeps_target(self, mgr: SessionManager) -> None:
         """Stale cleanup (unbind) must NOT erase the durable target —
         that's what lets a reboot auto-recover instead of losing the topic."""
-        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
+        mgr.bind_thread(100, 42, "UUID-1", window_name="dev", cwd="/p/dev")
         mgr.unbind_thread(100, 42)
-        assert mgr.thread_targets[100][42] == "dev"
+        assert mgr.thread_targets[100][42] == "/p/dev"
 
     def test_clear_thread_target_removes(self, mgr: SessionManager) -> None:
-        mgr.bind_thread(100, 42, "UUID-1", window_name="dev")
+        mgr.bind_thread(100, 42, "UUID-1", cwd="/p/dev")
         mgr.clear_thread_target(100, 42)
         assert 42 not in mgr.thread_targets.get(100, {})
 
-    async def test_rebind_unresolved_binds_matching_tab(
+    def test_refresh_backfills_cwd_from_window_state(self, mgr: SessionManager) -> None:
+        from ccbot.session import WindowState
+
+        # Bound before the cwd was known → no target yet.
+        mgr.thread_bindings = {100: {42: "U1"}}
+        mgr.window_states["U1"] = WindowState(window_name="dev", cwd="/p/dev")
+        mgr.refresh_thread_targets()
+        assert mgr.thread_targets[100][42] == "/p/dev"
+
+    def _sess(self, wid, name, cwd, is_ccbot=False):
+        from ccbot.iterm2_manager import ITermWindow
+
+        w = ITermWindow(wid, name, cwd, "")
+        w.is_ccbot = is_ccbot
+        return w
+
+    async def test_rebind_matches_untagged_tab_by_cwd_and_retags(
         self, mgr: SessionManager
     ) -> None:
         from unittest.mock import AsyncMock, patch
 
-        from ccbot.iterm2_manager import ITermWindow
-
-        # Target persists but the binding was dropped on reboot.
-        mgr.thread_targets = {100: {42: "dev"}}
-        live = [
-            ITermWindow(
-                window_id="NEW-UUID",
-                window_name="dev",
-                cwd="/x",
-                pane_current_command="",
-            )
-        ]
-        with patch(
-            "ccbot.session.iterm2_manager.list_windows",
-            AsyncMock(return_value=live),
+        # Reboot: binding dropped, target cwd persists, restored tab is UNTAGGED.
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        sess = self._sess("NEW", "Dev", "/p/dev", is_ccbot=False)
+        bes = AsyncMock(return_value=True)
+        with (
+            patch(
+                "ccbot.session.iterm2_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch("ccbot.session.iterm2_manager.bind_existing_session", bes),
         ):
             n = await mgr.rebind_unresolved()
         assert n == 1
-        assert mgr.get_window_for_thread(100, 42) == "NEW-UUID"
+        assert mgr.get_window_for_thread(100, 42) == "NEW"
+        bes.assert_awaited_once()  # untagged tab was re-tagged on adopt
 
-    async def test_rebind_unresolved_skips_ambiguous(self, mgr: SessionManager) -> None:
+    async def test_rebind_skips_retag_when_already_ccbot(
+        self, mgr: SessionManager
+    ) -> None:
         from unittest.mock import AsyncMock, patch
 
-        from ccbot.iterm2_manager import ITermWindow
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        sess = self._sess("NEW", "dev", "/p/dev", is_ccbot=True)
+        bes = AsyncMock(return_value=True)
+        with (
+            patch(
+                "ccbot.session.iterm2_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch("ccbot.session.iterm2_manager.bind_existing_session", bes),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 1
+        assert mgr.get_window_for_thread(100, 42) == "NEW"
+        bes.assert_not_awaited()  # already tagged — no re-tag needed
 
-        mgr.thread_targets = {100: {42: "dev"}}
-        live = [
-            ITermWindow("U1", "dev", "/a", ""),
-            ITermWindow("U2", "dev", "/b", ""),
+    async def test_rebind_skips_ambiguous_cwd(self, mgr: SessionManager) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        sessions = [
+            self._sess("U1", "dev", "/p/dev"),
+            self._sess("U2", "dev", "/p/dev"),
         ]
         with patch(
-            "ccbot.session.iterm2_manager.list_windows",
-            AsyncMock(return_value=live),
+            "ccbot.session.iterm2_manager.list_all_sessions",
+            AsyncMock(return_value=sessions),
         ):
             n = await mgr.rebind_unresolved()
         assert n == 0
         assert mgr.get_window_for_thread(100, 42) is None
-        # Target kept for a later, unambiguous attempt.
-        assert mgr.thread_targets[100][42] == "dev"
+        assert mgr.thread_targets[100][42] == "/p/dev"  # kept
 
-    async def test_rebind_unresolved_skips_already_live_binding(
-        self, mgr: SessionManager
-    ) -> None:
+    async def test_rebind_skips_already_live_binding(self, mgr: SessionManager) -> None:
         from unittest.mock import AsyncMock, patch
 
-        from ccbot.iterm2_manager import ITermWindow
-
-        mgr.bind_thread(100, 42, "LIVE-UUID", window_name="dev")
-        live = [ITermWindow("LIVE-UUID", "dev", "/x", "")]
+        mgr.bind_thread(100, 42, "LIVE", window_name="dev", cwd="/p/dev")
+        sessions = [self._sess("LIVE", "dev", "/p/dev", is_ccbot=True)]
         with patch(
-            "ccbot.session.iterm2_manager.list_windows",
-            AsyncMock(return_value=live),
+            "ccbot.session.iterm2_manager.list_all_sessions",
+            AsyncMock(return_value=sessions),
         ):
             n = await mgr.rebind_unresolved()
         assert n == 0
-        assert mgr.get_window_for_thread(100, 42) == "LIVE-UUID"
+        assert mgr.get_window_for_thread(100, 42) == "LIVE"
 
-    async def test_rebind_unresolved_no_targets_skips_network(
+    async def test_rebind_no_unresolved_skips_network(
         self, mgr: SessionManager
     ) -> None:
         from unittest.mock import AsyncMock, patch
 
-        with patch("ccbot.session.iterm2_manager.list_windows", AsyncMock()) as m:
+        with patch("ccbot.session.iterm2_manager.list_all_sessions", AsyncMock()) as m:
             n = await mgr.rebind_unresolved()
         assert n == 0
         m.assert_not_called()
 
-    async def test_rebind_unresolved_does_not_steal_bound_tab(
-        self, mgr: SessionManager
-    ) -> None:
+    async def test_rebind_does_not_steal_bound_tab(self, mgr: SessionManager) -> None:
         from unittest.mock import AsyncMock, patch
 
-        from ccbot.iterm2_manager import ITermWindow
-
-        # thread 1 already holds the only "dev" tab; thread 2 also wants "dev".
-        mgr.bind_thread(100, 1, "U1", window_name="dev")
-        mgr.thread_targets.setdefault(100, {})[2] = "dev"
-        live = [ITermWindow("U1", "dev", "/x", "")]
+        # thread 1 holds the only /p/dev tab; thread 2 also targets /p/dev.
+        mgr.bind_thread(100, 1, "U1", window_name="dev", cwd="/p/dev")
+        mgr.thread_targets.setdefault(100, {})[2] = "/p/dev"
+        sessions = [self._sess("U1", "dev", "/p/dev", is_ccbot=True)]
         with patch(
-            "ccbot.session.iterm2_manager.list_windows",
-            AsyncMock(return_value=live),
+            "ccbot.session.iterm2_manager.list_all_sessions",
+            AsyncMock(return_value=sessions),
         ):
             n = await mgr.rebind_unresolved()
         assert n == 0

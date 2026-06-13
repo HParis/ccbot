@@ -266,12 +266,14 @@ async def status_poll_loop(bot: Bot) -> None:
                         f"thread {thread_id}: {e}"
                     )
 
-            # Auto-rebind topics whose target tab has (re)appeared — e.g. after a
-            # reboot the user reopens their Claude tabs while iTerm2 stays
-            # connected.  Cheap no-op when nothing is unresolved; skipped while
-            # iTerm2 is unreachable to avoid mass churn during a transient drop.
+            # Keep durable cwd targets fresh for bound topics, then auto-rebind
+            # topics whose target tab has (re)appeared — e.g. after a reboot the
+            # user reopens their Claude tabs while iTerm2 stays connected.  Cheap
+            # no-op when nothing is unresolved; skipped while iTerm2 is
+            # unreachable to avoid mass churn during a transient drop.
             if iterm2_healthy:
                 try:
+                    session_manager.refresh_thread_targets()
                     await session_manager.rebind_unresolved()
                 except Exception as e:
                     logger.debug("rebind_unresolved failed: %s", e)
