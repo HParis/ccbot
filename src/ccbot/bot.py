@@ -280,6 +280,10 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     display = session_manager.get_display_name(wid)
     session_manager.unbind_thread(user.id, thread_id)
+    # Explicit user action — forget the durable rebind target too, otherwise the
+    # status-poll auto-rebind would re-attach this topic to the same live tab
+    # within a second and /unbind would appear to do nothing.
+    session_manager.clear_thread_target(user.id, thread_id)
     await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
 
     await safe_reply(

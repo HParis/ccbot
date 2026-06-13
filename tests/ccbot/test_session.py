@@ -625,6 +625,26 @@ class TestThreadTargets:
         w.is_ccbot = is_ccbot
         return w
 
+    async def test_cleared_target_is_not_auto_rebound(
+        self, mgr: SessionManager
+    ) -> None:
+        """Explicit /unbind clears the target, so rebind_unresolved must NOT
+        re-attach the topic even though a same-cwd live tab is present."""
+        from unittest.mock import AsyncMock, patch
+
+        mgr.bind_thread(100, 42, "U1", window_name="dev", cwd="/p/dev")
+        mgr.unbind_thread(100, 42)
+        mgr.clear_thread_target(100, 42)  # what /unbind now does
+        sessions = [self._sess("U1", "dev", "/p/dev", is_ccbot=True)]
+        with patch(
+            "ccbot.session.iterm2_manager.list_all_sessions",
+            AsyncMock(return_value=sessions),
+        ) as m:
+            n = await mgr.rebind_unresolved()
+        assert n == 0
+        assert mgr.get_window_for_thread(100, 42) is None
+        m.assert_not_called()  # no target left → cheap pre-check skips network
+
     async def test_rebind_matches_untagged_tab_by_cwd_and_retags(
         self, mgr: SessionManager
     ) -> None:
