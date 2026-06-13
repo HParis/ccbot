@@ -48,7 +48,7 @@ def _ensure_formatted(text: str) -> str:
 
 
 # Merge limit for content messages
-MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
+MERGE_MAX_LENGTH = 7400  # Under the 8000 split limit; room for MarkdownV2 escaping
 
 
 @dataclass

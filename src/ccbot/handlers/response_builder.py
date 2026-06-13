@@ -2,7 +2,7 @@
 
 Builds paginated response messages from Claude Code output:
   - Handles different content types (text, thinking, tool_use, tool_result)
-  - Splits long messages into pages within Telegram's 4096 char limit
+  - Splits long messages into pages within the per-message split limit
   - Truncates thinking content to keep messages compact
 
 Markdown conversion is NOT done here — the send layer (message_sender,
@@ -26,7 +26,7 @@ def build_response_parts(
 ) -> list[str]:
     """Build paginated response messages for Telegram.
 
-    Returns a list of raw markdown strings, each within Telegram's 4096 char limit.
+    Returns a list of raw markdown strings, each within the split limit.
     Multi-part messages get a [1/N] suffix.
     Markdown-to-MarkdownV2 conversion is done by the send layer, not here.
     """

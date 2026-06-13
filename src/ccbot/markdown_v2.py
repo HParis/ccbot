@@ -117,15 +117,16 @@ def _escape_mdv2(text: str) -> str:
 
 
 # Max rendered chars for a single expandable quote block.
-# Leaves room for surrounding text within Telegram's 4096 char message limit.
-_EXPQUOTE_MAX_RENDERED = 3800
+# Leaves room for surrounding text within the 8000 split limit (see
+# telegram_sender.TELEGRAM_MAX_MESSAGE_LENGTH).
+_EXPQUOTE_MAX_RENDERED = 7400
 
 
 def _render_expandable_quote(m: re.Match[str]) -> str:
     """Render an expandable blockquote block in raw MarkdownV2.
 
     Truncates the rendered output to _EXPQUOTE_MAX_RENDERED chars
-    to ensure the final message fits within Telegram's 4096 limit.
+    to ensure the final message fits within the split limit.
     """
     inner = m.group(1)
     escaped = _escape_mdv2(inner)

@@ -1,11 +1,19 @@
-"""Message splitting utility for Telegram's 4096-character limit.
+"""Message splitting utility for Telegram's per-message character limit.
 
 Provides:
-  - split_message(): splits long text into Telegram-safe chunks (≤4096 chars),
-    preferring newline boundaries and preserving code block integrity.
+  - split_message(): splits long text into Telegram-safe chunks, preferring
+    newline boundaries and preserving code block integrity.
+
+Telegram raised the bot message limit from 4096 to 32768 chars (2026), with a
+client-side "Show More" fold past ~8000 rendered chars. We split at 8000 so
+each relayed chunk stays a single unfolded message while drastically reducing
+the [1/N] fragmentation of long Claude output. Splitting happens on raw
+markdown; MarkdownV2 escaping expands it slightly, but stays far under 32768.
 """
 
-TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+# Raw-markdown split size. Kept at the ~8000 client fold threshold so rendered
+# messages stay unfolded for typical content (escaping adds little for prose).
+TELEGRAM_MAX_MESSAGE_LENGTH = 8000
 
 
 def split_message(

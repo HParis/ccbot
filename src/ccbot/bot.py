@@ -788,9 +788,9 @@ async def _capture_bash_output(
 
             last_output = output
 
-            # Truncate to fit Telegram's 4096-char limit
-            if len(output) > 3800:
-                output = "… " + output[-3800:]
+            # Truncate to fit within the per-message split limit
+            if len(output) > 7400:
+                output = "… " + output[-7400:]
 
             if msg_id is None:
                 # First capture — send a new message

@@ -2,7 +2,7 @@
 
 import pytest
 
-from ccbot.telegram_sender import split_message
+from ccbot.telegram_sender import TELEGRAM_MAX_MESSAGE_LENGTH, split_message
 
 
 class TestSplitMessage:
@@ -11,7 +11,11 @@ class TestSplitMessage:
         [
             pytest.param("hello world", ["hello world"], id="short_text"),
             pytest.param("", [""], id="empty_string"),
-            pytest.param("a" * 4096, ["a" * 4096], id="exactly_4096_chars"),
+            pytest.param(
+                "a" * TELEGRAM_MAX_MESSAGE_LENGTH,
+                ["a" * TELEGRAM_MAX_MESSAGE_LENGTH],
+                id="exactly_max_chars",
+            ),
         ],
     )
     def test_single_chunk_returned(self, text: str, expected: list[str]):
@@ -20,17 +24,19 @@ class TestSplitMessage:
     def test_split_on_newline_boundaries(self):
         line = "x" * 2000
         text = f"{line}\n{line}\n{line}"
-        chunks = split_message(text)
+        # Explicit max_length so the test exercises newline-boundary splitting
+        # independent of the default limit.
+        chunks = split_message(text, max_length=4096)
         assert len(chunks) == 2
         assert chunks[0] == f"{line}\n{line}"
         assert chunks[1] == line
 
     def test_single_long_line_force_split(self):
-        text = "a" * 8192
+        text = "a" * (TELEGRAM_MAX_MESSAGE_LENGTH * 2)
         chunks = split_message(text)
         assert len(chunks) == 2
-        assert chunks[0] == "a" * 4096
-        assert chunks[1] == "a" * 4096
+        assert chunks[0] == "a" * TELEGRAM_MAX_MESSAGE_LENGTH
+        assert chunks[1] == "a" * TELEGRAM_MAX_MESSAGE_LENGTH
 
     def test_custom_max_length(self):
         text = "aaaa\nbbbb\ncccc"

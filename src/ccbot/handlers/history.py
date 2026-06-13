@@ -196,7 +196,7 @@ async def send_history(
             else:
                 lines.append(msg_text)
         full_text = "\n\n".join(lines)
-        pages = split_message(full_text, max_length=4096)
+        pages = split_message(full_text)  # default = TELEGRAM_MAX_MESSAGE_LENGTH
 
         # Default to last page (newest messages) for both history and unread
         if offset < 0:
