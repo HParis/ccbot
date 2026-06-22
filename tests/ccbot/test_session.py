@@ -740,3 +740,28 @@ class TestThreadTargets:
             n = await mgr.rebind_unresolved()
         assert n == 0
         assert mgr.get_window_for_thread(100, 2) is None
+
+    async def test_rebind_recovers_stale_uuid_binding(
+        self, mgr: SessionManager
+    ) -> None:
+        """A binding pointing at a DEAD UUID (gone from window_states after an
+        iTerm2 restart) must count as unresolved and rebind by cwd — not be
+        skipped just because the binding is non-None."""
+        from unittest.mock import AsyncMock, patch
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        mgr.thread_bindings = {100: {42: "DEAD-UUID"}}  # bound, but dead
+        # window_states does NOT contain DEAD-UUID (reconciled away on restart).
+        sess = self._sess("NEW", "Dev", "/p/dev", is_ccbot=False)
+        bes = AsyncMock(return_value=True)
+        with (
+            patch(
+                "ccbot.session.iterm2_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch("ccbot.session.iterm2_manager.bind_existing_session", bes),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 1
+        assert mgr.get_window_for_thread(100, 42) == "NEW"
+        bes.assert_awaited_once()

@@ -881,11 +881,21 @@ class SessionManager:
         avoid grabbing the wrong tab — re-tag it (adopt) and bind.  Returns the
         number of topics rebound.
         """
-        # Cheap pre-check: skip the iTerm2 round-trip when no targeted topic is
-        # currently without a binding.  (Bindings still pointing at a dead UUID
-        # are unbound by status polling first; next cycle they read as None.)
+
+        # Cheap pre-check (no network): a targeted topic needs rebinding if it
+        # has NO binding, OR its binding points at a window_id we no longer know
+        # to be live.  After a bare iTerm2 restart the old UUIDs are dead but the
+        # bindings still reference them (non-None) — keying off None alone missed
+        # that and left topics permanently unbound.  window_states is reconciled
+        # against the live session_map (load_session_map), so "wid not in
+        # window_states" is a sound stale signal.  Over-firing is harmless: the
+        # authoritative live_ids check below still prevents wrong rebinds.
+        def _binding_is_live(uid: int, tid: int) -> bool:
+            wid = self.get_window_for_thread(uid, tid)
+            return wid is not None and wid in self.window_states
+
         has_unresolved = any(
-            self.get_window_for_thread(uid, tid) is None
+            not _binding_is_live(uid, tid)
             for uid, targets in self.thread_targets.items()
             for tid in targets
         )
