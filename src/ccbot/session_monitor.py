@@ -436,7 +436,10 @@ class SessionMonitor:
         try:
             data = json.loads(config.session_map_file.read_text())
             for key, info in data.items():
-                if key.startswith("iterm:") and info.get("session_id") == session_id:
+                scheme, sep, _ = key.partition(":")
+                if not sep or scheme == "ccbot":
+                    continue  # skip malformed / legacy tmux keys
+                if info.get("session_id") == session_id:
                     return info.get("cwd", "")
         except (json.JSONDecodeError, OSError):
             pass
@@ -463,8 +466,10 @@ class SessionMonitor:
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_id -> session_id mapping.
 
-        Keys in session_map are formatted as ``iterm:<UUID>``. Legacy
-        ``ccbot:`` keys (tmux era) are silently ignored — they will be
+        Keys are formatted as ``<backend>:<window_id>`` (e.g. ``iterm:<UUID>``
+        or ``otty:<pane_id>``); the backend prefix is stripped so the window
+        key is backend-neutral. Legacy ``ccbot:`` keys (tmux era) and any
+        malformed prefix-less keys are silently ignored — they will be
         overwritten on next SessionStart hook fire.
         """
         window_to_session: dict[str, str] = {}
@@ -473,11 +478,10 @@ class SessionMonitor:
                 async with aiofiles.open(config.session_map_file, "r") as f:
                     content = await f.read()
                 session_map = json.loads(content)
-                prefix = "iterm:"
                 for key, info in session_map.items():
-                    if not key.startswith(prefix):
+                    scheme, sep, window_key = key.partition(":")
+                    if not sep or scheme == "ccbot":
                         continue
-                    window_key = key[len(prefix) :]
                     session_id = info.get("session_id", "")
                     if session_id:
                         window_to_session[window_key] = session_id
