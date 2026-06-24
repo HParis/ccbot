@@ -188,6 +188,14 @@ class OttyManager:
         """No persistent connection; nothing to reset."""
         self._reachable = True
 
+    async def ensure_running(self) -> bool:
+        """Ensure Otty is up, launching it on demand; report reachability."""
+        try:
+            await self.preflight()
+            return True
+        except ConnectionError:
+            return False
+
     def is_reachable(self) -> bool:
         return self._reachable
 

@@ -1104,6 +1104,9 @@ class SessionManager:
         beats us to this, but the fallback covers the gap between iTerm2
         coming back up and the listener firing.
         """
+        # User-driven send: make sure the terminal app is up (auto-launch if
+        # it was closed). Background polling stays passive and won't relaunch.
+        await terminal_manager.ensure_running()
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",

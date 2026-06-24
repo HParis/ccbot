@@ -524,6 +524,14 @@ class ITerm2Manager:
         """Drop the cached connection so the next call reconnects fresh."""
         self._invalidate_connection()
 
+    async def ensure_running(self) -> bool:
+        """Ensure iTerm2 is up (``_get_app`` auto-launches it); report reach."""
+        try:
+            await self._get_app()
+            return True
+        except ConnectionError:
+            return False
+
     # ------------------------------------------------------------------
     # Read-only discovery
     # ------------------------------------------------------------------

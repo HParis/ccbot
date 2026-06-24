@@ -110,6 +110,21 @@ async def test_preflight_raises_when_unreachable(monkeypatch) -> None:
     assert mgr.is_reachable() is False
 
 
+async def test_ensure_running_launches_and_returns_bool(monkeypatch) -> None:
+    monkeypatch.setattr("ccbot.terminal.otty._LAUNCH_DELAYS", (0.0,))
+
+    async def dead(args: list[str]) -> tuple[int, str, str]:
+        return _fail(rc=1, err="no app")
+
+    # Down and unlaunchable -> False (no raise).
+    mgr = OttyManager(cli_path="/fake/otty-cli", socket_path="", runner=dead)
+    assert await mgr.ensure_running() is False
+
+    # Already up -> True.
+    ok_mgr = _mgr(FakeCli())
+    assert await ok_mgr.ensure_running() is True
+
+
 async def test_preflight_auto_launches_then_succeeds(monkeypatch) -> None:
     monkeypatch.setattr("ccbot.terminal.otty._LAUNCH_DELAYS", (0.0, 0.0))
     state = {"up": False, "opened": False}

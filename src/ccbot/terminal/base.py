@@ -105,6 +105,16 @@ class TerminalBackend(Protocol):
         """Drop any cached connection so the next call reconnects fresh."""
         ...
 
+    async def ensure_running(self) -> bool:
+        """Best-effort: ensure the terminal app is up, launching it if needed.
+
+        Returns whether the terminal is reachable afterwards. Unlike background
+        queries (which fail passively so they don't fight a deliberate close),
+        this is called on user-driven actions like sending a message, so the
+        app gets relaunched on demand.
+        """
+        ...
+
     def is_reachable(self) -> bool:
         """Cheap, side-effect-free check for whether the terminal is up."""
         ...
