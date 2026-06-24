@@ -261,6 +261,20 @@ async def test_create_window_rejects_missing_dir() -> None:
     assert "does not exist" in msg
 
 
+async def test_create_window_fails_gracefully_when_otty_down(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr("ccbot.terminal.otty._LAUNCH_DELAYS", (0.0,))
+
+    async def dead(args: list[str]) -> tuple[int, str, str]:
+        return _fail(rc=3, err="Cannot connect to Otty. Is Otty running?")
+
+    mgr = OttyManager(cli_path="/fake/otty-cli", socket_path="", runner=dead)
+    ok, msg, name, wid = await mgr.create_window(str(tmp_path))
+    assert ok is False and wid == ""
+    assert "could not be launched" in msg
+
+
 async def test_create_window_injects_session_key_when_starting_claude(
     tmp_path,
 ) -> None:

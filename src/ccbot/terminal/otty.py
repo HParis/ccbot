@@ -419,6 +419,14 @@ class OttyManager:
         if not path.is_dir():
             return False, f"Not a directory: {work_dir}", "", ""
 
+        # Otty may have been closed since startup; ensure it's up (preflight
+        # pings and auto-launches) before creating a tab, so a closed app is
+        # recovered rather than surfacing as "Failed to create Otty tab".
+        try:
+            await self.preflight()
+        except ConnectionError as e:
+            return False, f"Otty is not running and could not be launched: {e}", "", ""
+
         # De-dup the display name against currently-owned sessions.
         final_name = window_name or path.name
         base = final_name
