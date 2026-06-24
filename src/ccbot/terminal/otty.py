@@ -50,6 +50,10 @@ _BUNDLE_CLI = "/Applications/Otty.app/Contents/MacOS/otty-cli"
 _OTTY_BUNDLE_ID = "io.appmakes.otty"
 _LAUNCH_DELAYS: tuple[float, ...] = (1.5, 2.0, 3.0, 4.0)
 
+# Longer IPC timeout (ms) for closing a tab whose foreground TUI is busy;
+# the default 3s often elapses before otty-cli gets the close ack.
+_CLOSE_TIMEOUT_MS = 12000
+
 # Otty pane ids look like ``p_19ef87d6b65_1`` (used as session_map suffixes).
 _PANE_ID_RE = re.compile(r"^p_[0-9a-z]+_\d+$")
 
@@ -203,13 +207,16 @@ class OttyManager:
         cmd += list(args)
         return cmd
 
-    async def _run_json(self, *args: str) -> dict | None:
+    async def _run_json(self, *args: str, timeout_ms: int | None = None) -> dict | None:
         """Run an otty-cli command with --json; return the parsed object.
 
         Returns None on process error, non-JSON output, or ``ok: false``.
-        Updates the reachability flag as a side effect.
+        Updates the reachability flag as a side effect. ``timeout_ms`` overrides
+        otty-cli's default IPC timeout (3s) for slow ops like closing a tab
+        that's running a busy TUI.
         """
-        cmd = self._base("--json", *args)
+        extra = ["--timeout", str(timeout_ms)] if timeout_ms else []
+        cmd = self._base("--json", *extra, *args)
         try:
             rc, out, err = await self._runner(cmd)
         except Exception as e:
@@ -386,7 +393,11 @@ class OttyManager:
             logger.debug("Otty kill: pane %s already gone", window_id)
             self._owned.discard(window_id)
             return False
-        res = await self._run_json("tab", "close", "--tab", tab_id, "--force")
+        # Closing a tab running a busy TUI (claude) can exceed the default 3s
+        # IPC window; the close still happens but the response is slow.
+        res = await self._run_json(
+            "tab", "close", "--tab", tab_id, "--force", timeout_ms=_CLOSE_TIMEOUT_MS
+        )
         ok = res is not None
         if ok:
             self._owned.discard(window_id)

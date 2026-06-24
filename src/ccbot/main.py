@@ -53,12 +53,13 @@ def main() -> None:
     logger.info("Allowed users: %s", config.allowed_users)
     logger.info("Claude projects path: %s", config.claude_projects_path)
 
-    # Verify iTerm2 is reachable before starting the bot.  The bot
-    # cannot do anything useful if iTerm2 isn't running or the Python
-    # API isn't enabled, so fail fast with a clear message.  The
-    # connection here is bound to this short-lived event loop; we
-    # invalidate it so the bot's own event loop opens a fresh one.
-    logger.info("Verifying iTerm2 connectivity...")
+    # Verify the terminal backend is reachable before starting the bot.
+    # The bot can't do anything useful if its terminal isn't running, so
+    # fail fast with a clear message. The connection here is bound to this
+    # short-lived event loop; we reset it so the bot's own event loop opens
+    # a fresh one.
+    logger.info("Using terminal backend: %s", config.backend)
+    logger.info("Verifying %s connectivity...", config.backend)
     try:
         asyncio.run(terminal_manager.preflight())
     except ConnectionError as e:
@@ -66,7 +67,7 @@ def main() -> None:
         sys.exit(1)
     finally:
         terminal_manager.reset_connection()
-    logger.info("iTerm2 connection verified")
+    logger.info("%s connection verified", config.backend)
 
     logger.info("Starting Telegram bot...")
     from .bot import create_bot

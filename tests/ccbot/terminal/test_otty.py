@@ -39,10 +39,21 @@ class FakeCli:
 
     async def __call__(self, args: list[str]) -> tuple[int, str, str]:
         self.calls.append(args)
-        # Strip the leading cli path; find the subcommand pair.
+        # Strip the leading cli path and global flags (incl. flag values) so
+        # toks[:2] is the subcommand pair regardless of --json/--timeout/--socket.
         rest = args[1:]
-        # Drop global flags we don't care about for matching.
-        toks = [a for a in rest if a not in ("--json",)]
+        toks: list[str] = []
+        skip = False
+        for a in rest:
+            if skip:
+                skip = False
+                continue
+            if a == "--json":
+                continue
+            if a in ("--timeout", "--socket"):
+                skip = True
+                continue
+            toks.append(a)
 
         if toks[:2] == ["window", "list"]:
             return _ok([{"id": "w_1"}])
@@ -213,6 +224,8 @@ async def test_kill_window_closes_tab_and_unowns() -> None:
     assert await mgr.kill_window("p_a")
     close = [c for c in fake.calls if "close" in c][0]
     assert "t_a" in close and "--force" in close
+    # Closing a busy TUI tab needs a longer IPC timeout than the 3s default.
+    assert "--timeout" in close
     assert "p_a" not in mgr._owned
 
 
