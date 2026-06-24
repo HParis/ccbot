@@ -25,7 +25,7 @@ from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
-from ..iterm2_manager import iterm2_manager
+from ..terminal.manager import terminal_manager
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -59,7 +59,7 @@ async def update_status_message(
     Also detects permission prompt UIs (not triggered via JSONL) and enters
     interactive mode when found.
     """
-    w = await iterm2_manager.find_window_by_id(window_id)
+    w = await terminal_manager.find_window_by_id(window_id)
     if not w:
         # Window gone, enqueue clear (unless skipping status)
         if not skip_status:
@@ -68,7 +68,7 @@ async def update_status_message(
             )
         return
 
-    pane_text = await iterm2_manager.capture_pane(w.window_id)
+    pane_text = await terminal_manager.capture_pane(w.window_id)
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
@@ -152,9 +152,9 @@ async def status_poll_loop(bot: Bot) -> None:
                     except BadRequest as e:
                         if "Topic_id_invalid" in str(e):
                             # Topic deleted — kill window, unbind, and clean up state
-                            w = await iterm2_manager.find_window_by_id(wid)
+                            w = await terminal_manager.find_window_by_id(wid)
                             if w:
-                                await iterm2_manager.kill_window(w.window_id)
+                                await terminal_manager.kill_window(w.window_id)
                             session_manager.unbind_thread(user_id, thread_id)
                             # Topic genuinely gone — forget its rebind target.
                             session_manager.clear_thread_target(user_id, thread_id)
@@ -189,23 +189,23 @@ async def status_poll_loop(bot: Bot) -> None:
             # drop (user quits iTerm2, reboots, lid-close, etc.) would
             # otherwise read as "every tab is gone" and wipe every
             # thread binding before the reconnect lands seconds later.
-            iterm2_healthy = iterm2_manager.is_reachable()
+            iterm2_healthy = terminal_manager.is_reachable()
 
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
                     if not iterm2_healthy:
                         continue
                     # Clean up stale bindings (window no longer exists)
-                    w = await iterm2_manager.find_window_by_id(wid)
+                    w = await terminal_manager.find_window_by_id(wid)
                     if not w:
                         # Double-check after the call: if iTerm2 just
                         # tripped the breaker, the None doesn't prove the
                         # tab is gone — it just proves we couldn't ask.
-                        if not iterm2_manager.is_reachable():
+                        if not terminal_manager.is_reachable():
                             continue
                         display = session_manager.get_display_name(wid)
                         # Try auto-rebind: find unbound window with same name
-                        all_windows = await iterm2_manager.list_windows()
+                        all_windows = await terminal_manager.list_windows()
                         bound_wids = {
                             bw
                             for _, _, bw in session_manager.iter_thread_bindings()

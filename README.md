@@ -1,9 +1,6 @@
 # CCBot
 
-[中文文档](README_CN.md)
-[Русская документация](README_RU.md)
-
-Control Claude Code sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in iTerm2 (macOS).
+Control Claude Code sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in a macOS terminal (iTerm2 by default, or Otty).
 
 https://github.com/user-attachments/assets/15ffb38e-5eb9-4720-93b9-412e4961dc93
 
@@ -39,10 +36,18 @@ In fact, CCBot itself was built this way — iterating on itself through Claude 
 
 ## Prerequisites
 
-- **macOS only** — iTerm2 is macOS-exclusive
-- **iTerm2** — installed, running, and with the Python API enabled (Preferences → General → Magic → Enable Python API)
-- **iTerm2 profile (recommended): `ccbot`** — set its Title field to "Session Name" so Claude Code's TUI cannot override the tab name. See `docs/migration-iterm2.md` for setup details.
+- **macOS** — the supported terminal backends (iTerm2, Otty) are macOS apps
+- **A terminal backend** — one of:
+  - **iTerm2** (default): installed, running, with the Python API enabled
+    (Preferences → General → Magic → Enable Python API). Recommended: an
+    iTerm2 profile named `ccbot` with its Title field set to "Session Name"
+    so Claude Code's TUI cannot override the tab name. See
+    `docs/migration-iterm2.md`.
+  - **Otty** (`CCBOT_BACKEND=otty`): installed and running, with
+    `ipc-allow-send-keys = true` in `~/.config/otty/config.toml`.
 - **Claude Code** — the CLI tool (`claude`) must be installed
+
+See [Terminal Backend](#terminal-backend) below for how to choose and configure one.
 
 ## Installation
 
@@ -94,7 +99,10 @@ ALLOWED_USERS=your_telegram_user_id
 | Variable                | Default    | Description                                      |
 | ----------------------- | ---------- | ------------------------------------------------ |
 | `CCBOT_DIR`             | `~/.ccbot` | Config/state directory (`.env` loaded from here) |
-| `TMUX_SESSION_NAME`     | `ccbot`    | Tmux session name                                |
+| `CCBOT_BACKEND`         | `iterm2`   | Terminal backend hosting sessions: `iterm2` or `otty` |
+| `CCBOT_ITERM2_PROFILE`  | `ccbot`    | iTerm2 profile used for new tabs (iTerm2 backend) |
+| `CCBOT_OTTY_CLI`        | _(auto)_   | Path to `otty-cli` (Otty backend; auto-resolved if empty) |
+| `CCBOT_OTTY_SOCKET`     | _(none)_   | Otty IPC control socket override (Otty backend)  |
 | `CLAUDE_COMMAND`        | `claude`   | Command to run in new windows                    |
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
@@ -109,6 +117,49 @@ There is no runtime formatter switch to MarkdownV2.
 > ```
 > CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
 > ```
+
+## Terminal Backend
+
+CCBot hosts each Claude Code session in a GUI terminal tab and drives it
+(reads output, sends keystrokes, creates/closes tabs). The backend is
+selected once at startup with `CCBOT_BACKEND`; the default is `iterm2`.
+
+### iTerm2 (default)
+
+1. Enable the Python API: iTerm2 → Preferences → General → Magic → **Enable Python API**.
+2. (Recommended) Create a profile named `ccbot` and set its **Title** field to
+   "Session Name" so Claude Code's TUI can't rename the tab. See
+   `docs/migration-iterm2.md`.
+3. Leave `CCBOT_BACKEND` unset (or `iterm2`). iTerm2 must stay running — quitting
+   it kills every managed session.
+
+### Otty
+
+```ini
+CCBOT_BACKEND=otty
+```
+
+1. Install and run [Otty](https://docs.otty.sh/).
+2. **Enable remote key injection** (off by default) — CCBot can't send messages
+   to Claude without it:
+
+   ```bash
+   otty config set ipc-allow-send-keys true
+   otty config reload
+   ```
+
+3. CCBot auto-locates `otty-cli` (PATH or the app bundle); override with
+   `CCBOT_OTTY_CLI` if needed.
+
+Differences from iTerm2 to be aware of:
+
+- **Screenshots are monochrome** — Otty's text capture carries no color.
+- **No native tab tagging** — ownership is tracked in-process and re-resolved by
+  working directory; a CCBot restart re-adopts tabs as topics are used again.
+- **No reconnect events** — recovery is poll-based.
+
+Adding another terminal is a small effort: implement one backend in
+`src/ccbot/terminal/` and register it. See `CLAUDE.md` → "Terminal Backends".
 
 ## Hook Setup (Recommended)
 
@@ -132,7 +183,7 @@ Or manually add to `~/.claude/settings.json`:
 }
 ```
 
-This writes UUID-keyed mappings to `$CCBOT_DIR/session_map.json` (`~/.ccbot/` by default), so the bot automatically tracks which Claude session is running in each iTerm2 tab — even after `/clear` or session restarts.
+This writes terminal-session-keyed mappings to `$CCBOT_DIR/session_map.json` (`~/.ccbot/` by default), so the bot automatically tracks which Claude session is running in each terminal tab — even after `/clear` or session restarts. The hook works for any backend: it keys on `ITERM_SESSION_ID` for iTerm2, or on the `CCBOT_SESSION_KEY` that CCBot injects at launch for backends like Otty.
 
 ## Usage
 

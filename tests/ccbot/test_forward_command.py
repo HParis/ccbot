@@ -40,7 +40,7 @@ class TestForwardCommand:
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
             patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.iterm2_manager") as mock_iterm,
+            patch("ccbot.bot.terminal_manager") as mock_iterm,
             patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
         ):
             mock_sm.resolve_window_for_thread.return_value = "@5"
@@ -64,7 +64,7 @@ class TestForwardCommand:
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
             patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.iterm2_manager") as mock_iterm,
+            patch("ccbot.bot.terminal_manager") as mock_iterm,
             patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
         ):
             mock_sm.resolve_window_for_thread.return_value = "@5"
@@ -88,7 +88,7 @@ class TestForwardCommand:
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
             patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.iterm2_manager") as mock_iterm,
+            patch("ccbot.bot.terminal_manager") as mock_iterm,
             patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
         ):
             mock_sm.resolve_window_for_thread.return_value = "@5"
@@ -118,7 +118,7 @@ class TestForwardCommand:
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
             patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.iterm2_manager") as mock_iterm,
+            patch("ccbot.bot.terminal_manager") as mock_iterm,
             patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
         ):
             mock_sm.resolve_window_for_thread.return_value = "@5"

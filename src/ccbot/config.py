@@ -64,6 +64,18 @@ class Config:
         # override it via OSC sequences).
         self.iterm2_profile_name = os.getenv("CCBOT_ITERM2_PROFILE", "ccbot")
 
+        # Terminal backend that hosts Claude Code sessions. Selected once
+        # at startup; see ccbot.terminal for the pluggable backend layer.
+        # Defaults to "iterm2" to preserve existing behavior.
+        self.backend = os.getenv("CCBOT_BACKEND", "iterm2")
+
+        # Otty backend (CCBOT_BACKEND=otty): path to the bundled otty-cli
+        # (empty → OttyManager resolves it) and an optional IPC socket
+        # override. Otty also requires `ipc-allow-send-keys = true` in its
+        # own config for the bot to drive sessions.
+        self.otty_cli = os.getenv("CCBOT_OTTY_CLI", "")
+        self.otty_socket = os.getenv("CCBOT_OTTY_SOCKET", "")
+
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
 

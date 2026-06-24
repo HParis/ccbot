@@ -22,16 +22,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import tempfile
 from asyncio import sleep as _sleep
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 import iterm2
 import iterm2.screen as iterm2_screen
 
-ReconnectListener = Callable[[], Awaitable[None]]
+from .terminal.base import Capabilities, ReconnectListener, TerminalSession
+from .terminal.registry import register
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,12 @@ _LAUNCH_DELAYS: tuple[float, ...] = (1.5, 2.0, 3.0, 5.0)
 _CCBOT_TAG_NAME = "user.ccbot"
 _CCBOT_TAG_VALUE = "1"
 
+# An iTerm2 session id is a UUID (used by is_session_id for session_map keys).
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
 # Named-key escape sequences used when ``send_keys(..., literal=False)``.
 # Anything not listed here is sent verbatim, matching the previous
 # tmux backend's behaviour for unrecognised key names.
@@ -87,25 +93,11 @@ _ENTER_DELAY = 0.5
 _BASH_PREFIX_DELAY = 1.0
 
 
-@dataclass
-class ITermWindow:
-    """Information about an iTerm2 tab/session.
-
-    Field names match the previous TmuxWindow dataclass so callers don't
-    need to change. ``window_id`` carries the iTerm2 session UUID.
-
-    ``is_ccbot`` and ``has_claude`` are populated by ``list_all_sessions``
-    for the bind-existing-tab picker; the lifecycle methods
-    (``find_window_by_id`` etc.) leave them at their defaults because
-    they only return ccbot-owned sessions, where both are implicitly True.
-    """
-
-    window_id: str  # iTerm2 session UUID
-    window_name: str  # iTerm2 session name (set via async_set_name)
-    cwd: str  # session's current working directory (or "")
-    pane_current_command: str = ""  # foreground job name (or "")
-    is_ccbot: bool = False  # tagged with user.ccbot=1
-    has_claude: bool = False  # session_map.json has an entry for this UUID
+# ``ITermWindow`` is retained as a backward-compatible alias for the
+# vendor-neutral ``TerminalSession`` (identical fields). Existing call
+# sites and tests import ``ITermWindow``; new code should prefer
+# ``TerminalSession``. ``window_id`` carries the iTerm2 session UUID.
+ITermWindow = TerminalSession
 
 
 class ITerm2Manager:
@@ -496,6 +488,41 @@ class ITerm2Manager:
         """Drop cached connection so the next call reconnects."""
         self._connection = None
         self._app = None
+
+    # ------------------------------------------------------------------
+    # TerminalBackend contract: capabilities + neutral lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def capabilities(self) -> Capabilities:
+        """iTerm2 supports the full feature set."""
+        return Capabilities(
+            ansi_capture=True,
+            native_tagging=True,
+            reconnect_events=True,
+            screenshot=True,
+        )
+
+    @property
+    def session_map_prefix(self) -> str:
+        return "iterm:"
+
+    def is_session_id(self, candidate: str) -> bool:
+        """An iTerm2 session id is a UUID."""
+        return bool(_UUID_RE.match(candidate))
+
+    async def preflight(self) -> None:
+        """Verify iTerm2 is reachable, raising ConnectionError if not.
+
+        Opens (and the caller should ``reset_connection``) a connection
+        bound to the current event loop. Mirrors the startup check that
+        previously called ``_get_connection`` directly.
+        """
+        await self._get_connection()
+
+    def reset_connection(self) -> None:
+        """Drop the cached connection so the next call reconnects fresh."""
+        self._invalidate_connection()
 
     # ------------------------------------------------------------------
     # Read-only discovery
@@ -1173,3 +1200,9 @@ def _line_to_ansi(line: iterm2_screen.LineContents) -> str:
 
 
 iterm2_manager = ITerm2Manager()
+
+
+# Register under the "iterm2" backend name. The factory returns the
+# module singleton so every consumer (and the test suite, which imports
+# ``iterm2_manager`` directly) shares one instance and its connection.
+register("iterm2")(lambda: iterm2_manager)

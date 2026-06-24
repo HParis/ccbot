@@ -33,7 +33,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .iterm2_manager import iterm2_manager
+from .terminal.manager import terminal_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
@@ -45,9 +45,11 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
-# session_map.json key prefix for iTerm2 backend entries.  Legacy
-# entries keyed by ``ccbot:`` (tmux era) are filtered out at read time.
-_SESSION_MAP_PREFIX = "iterm:"
+# session_map.json key prefix for the active terminal backend (e.g.
+# ``iterm:`` for iTerm2, ``otty:`` for Otty). Derived from the selected
+# backend so the hook and the bot agree on the key. Legacy/foreign-prefix
+# entries are filtered out at read time.
+_SESSION_MAP_PREFIX = terminal_manager.session_map_prefix
 
 
 @dataclass
@@ -154,17 +156,18 @@ class SessionManager:
     def _is_window_id(self, key: str) -> bool:
         """Check if a key looks like a window ID we recognise.
 
-        Accepts two formats:
-          - iTerm2 session UUID — current format.
+        Accepts:
+          - the active backend's session-id shape (iTerm2 UUID, Otty
+            ``p_*``, ...) — current format.
           - tmux window ID like ``@0`` / ``@12`` — legacy.  Returning
             True here lets ``resolve_stale_ids`` re-key these via
-            display-name lookup against live iTerm2 sessions on
-            startup; otherwise the binding would be dropped as an
-            unrecognised old-format key.
+            display-name lookup against live sessions on startup;
+            otherwise the binding would be dropped as an unrecognised
+            old-format key.
         """
         if key.startswith("@") and len(key) > 1 and key[1:].isdigit():
             return True
-        return bool(_UUID_RE.match(key))
+        return terminal_manager.is_session_id(key)
 
     def _load_state(self) -> None:
         """Load state synchronously during initialization.
@@ -237,7 +240,7 @@ class SessionManager:
 
         Builds {window_name: window_id} from live windows, then remaps or drops entries.
         """
-        windows = await iterm2_manager.list_windows()
+        windows = await terminal_manager.list_windows()
         live_by_name: dict[str, str] = {}  # window_name -> window_id
         live_ids: set[str] = set()
         for w in windows:
@@ -384,7 +387,7 @@ class SessionManager:
         # session_id is gone, the picker thinks Claude isn't running, and
         # `claude` gets typed into a tab that already has Claude open.
         # Use the unfiltered live set instead.
-        all_live = await iterm2_manager.list_all_sessions()
+        all_live = await terminal_manager.list_all_sessions()
         all_live_ids = {w.window_id for w in all_live}
         await self._cleanup_stale_session_map_entries(all_live_ids)
         await self._cleanup_old_format_session_map_keys()
@@ -902,7 +905,7 @@ class SessionManager:
         if not has_unresolved:
             return 0
 
-        sessions = await iterm2_manager.list_all_sessions()
+        sessions = await terminal_manager.list_all_sessions()
         live_ids = {s.window_id for s in sessions}
         bound = {wid for _, _, wid in self.iter_thread_bindings()}
         claimed: set[str] = set()
@@ -926,7 +929,7 @@ class SessionManager:
                 # Re-tag untagged (reboot-orphaned) tabs so the rest of the
                 # pipeline can drive them again; already-tagged ones skip this.
                 if not sess.is_ccbot:
-                    if not await iterm2_manager.bind_existing_session(
+                    if not await terminal_manager.bind_existing_session(
                         sess.window_id, name
                     ):
                         continue
@@ -1108,16 +1111,16 @@ class SessionManager:
             display,
             len(text),
         )
-        window = await iterm2_manager.find_window_by_id(window_id)
+        window = await terminal_manager.find_window_by_id(window_id)
         if window is None:
             new_id = await self._migrate_stale_window_id(window_id)
             if new_id and new_id != window_id:
-                window = await iterm2_manager.find_window_by_id(new_id)
+                window = await terminal_manager.find_window_by_id(new_id)
                 if window is not None:
                     window_id = new_id
         if window is None:
             return False, "Window not found (may have been closed)"
-        success = await iterm2_manager.send_keys(window.window_id, text)
+        success = await terminal_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"
@@ -1133,7 +1136,7 @@ class SessionManager:
         display = self.window_display_names.get(old_id)
         if not display:
             return None
-        window = await iterm2_manager.find_window_by_name(display)
+        window = await terminal_manager.find_window_by_name(display)
         if window is None:
             return None
         new_id = window.window_id

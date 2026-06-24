@@ -195,7 +195,7 @@ class TestResolveStaleIdsTmuxMigration:
             )
         ]
         with patch(
-            "ccbot.session.iterm2_manager.list_windows",
+            "ccbot.session.terminal_manager.list_windows",
             AsyncMock(return_value=live),
         ):
             await mgr.resolve_stale_ids()
@@ -218,7 +218,7 @@ class TestResolveStaleIdsTmuxMigration:
         mgr.window_display_names = {"@5": "gone"}
 
         with patch(
-            "ccbot.session.iterm2_manager.list_windows", AsyncMock(return_value=[])
+            "ccbot.session.terminal_manager.list_windows", AsyncMock(return_value=[])
         ):
             await mgr.resolve_stale_ids()
 
@@ -253,15 +253,15 @@ class TestSendToWindowStaleUuidFallback:
 
         with (
             patch(
-                "ccbot.session.iterm2_manager.find_window_by_id",
+                "ccbot.session.terminal_manager.find_window_by_id",
                 AsyncMock(side_effect=fake_find_by_id),
             ),
             patch(
-                "ccbot.session.iterm2_manager.find_window_by_name",
+                "ccbot.session.terminal_manager.find_window_by_name",
                 AsyncMock(return_value=live),
             ),
             patch(
-                "ccbot.session.iterm2_manager.send_keys",
+                "ccbot.session.terminal_manager.send_keys",
                 AsyncMock(return_value=True),
             ) as send_keys,
         ):
@@ -288,11 +288,11 @@ class TestSendToWindowStaleUuidFallback:
 
         with (
             patch(
-                "ccbot.session.iterm2_manager.find_window_by_id",
+                "ccbot.session.terminal_manager.find_window_by_id",
                 AsyncMock(return_value=None),
             ),
             patch(
-                "ccbot.session.iterm2_manager.find_window_by_name",
+                "ccbot.session.terminal_manager.find_window_by_name",
                 AsyncMock(return_value=None),
             ),
         ):
@@ -348,11 +348,11 @@ class TestSessionMapCleanupHonoursUntaggedTabs:
 
         with (
             patch(
-                "ccbot.session.iterm2_manager.list_windows",
+                "ccbot.session.terminal_manager.list_windows",
                 AsyncMock(return_value=[]),  # no ccbot-tagged tabs
             ),
             patch(
-                "ccbot.session.iterm2_manager.list_all_sessions",
+                "ccbot.session.terminal_manager.list_all_sessions",
                 AsyncMock(return_value=[live_untagged]),
             ),
         ):
@@ -394,11 +394,11 @@ class TestSessionMapCleanupHonoursUntaggedTabs:
 
         with (
             patch(
-                "ccbot.session.iterm2_manager.list_windows",
+                "ccbot.session.terminal_manager.list_windows",
                 AsyncMock(return_value=[]),
             ),
             patch(
-                "ccbot.session.iterm2_manager.list_all_sessions",
+                "ccbot.session.terminal_manager.list_all_sessions",
                 AsyncMock(return_value=[]),
             ),
         ):
@@ -637,7 +637,7 @@ class TestThreadTargets:
         mgr.clear_thread_target(100, 42)  # what /unbind now does
         sessions = [self._sess("U1", "dev", "/p/dev", is_ccbot=True)]
         with patch(
-            "ccbot.session.iterm2_manager.list_all_sessions",
+            "ccbot.session.terminal_manager.list_all_sessions",
             AsyncMock(return_value=sessions),
         ) as m:
             n = await mgr.rebind_unresolved()
@@ -656,10 +656,10 @@ class TestThreadTargets:
         bes = AsyncMock(return_value=True)
         with (
             patch(
-                "ccbot.session.iterm2_manager.list_all_sessions",
+                "ccbot.session.terminal_manager.list_all_sessions",
                 AsyncMock(return_value=[sess]),
             ),
-            patch("ccbot.session.iterm2_manager.bind_existing_session", bes),
+            patch("ccbot.session.terminal_manager.bind_existing_session", bes),
         ):
             n = await mgr.rebind_unresolved()
         assert n == 1
@@ -676,10 +676,10 @@ class TestThreadTargets:
         bes = AsyncMock(return_value=True)
         with (
             patch(
-                "ccbot.session.iterm2_manager.list_all_sessions",
+                "ccbot.session.terminal_manager.list_all_sessions",
                 AsyncMock(return_value=[sess]),
             ),
-            patch("ccbot.session.iterm2_manager.bind_existing_session", bes),
+            patch("ccbot.session.terminal_manager.bind_existing_session", bes),
         ):
             n = await mgr.rebind_unresolved()
         assert n == 1
@@ -695,7 +695,7 @@ class TestThreadTargets:
             self._sess("U2", "dev", "/p/dev"),
         ]
         with patch(
-            "ccbot.session.iterm2_manager.list_all_sessions",
+            "ccbot.session.terminal_manager.list_all_sessions",
             AsyncMock(return_value=sessions),
         ):
             n = await mgr.rebind_unresolved()
@@ -709,7 +709,7 @@ class TestThreadTargets:
         mgr.bind_thread(100, 42, "LIVE", window_name="dev", cwd="/p/dev")
         sessions = [self._sess("LIVE", "dev", "/p/dev", is_ccbot=True)]
         with patch(
-            "ccbot.session.iterm2_manager.list_all_sessions",
+            "ccbot.session.terminal_manager.list_all_sessions",
             AsyncMock(return_value=sessions),
         ):
             n = await mgr.rebind_unresolved()
@@ -721,7 +721,9 @@ class TestThreadTargets:
     ) -> None:
         from unittest.mock import AsyncMock, patch
 
-        with patch("ccbot.session.iterm2_manager.list_all_sessions", AsyncMock()) as m:
+        with patch(
+            "ccbot.session.terminal_manager.list_all_sessions", AsyncMock()
+        ) as m:
             n = await mgr.rebind_unresolved()
         assert n == 0
         m.assert_not_called()
@@ -734,7 +736,7 @@ class TestThreadTargets:
         mgr.thread_targets.setdefault(100, {})[2] = "/p/dev"
         sessions = [self._sess("U1", "dev", "/p/dev", is_ccbot=True)]
         with patch(
-            "ccbot.session.iterm2_manager.list_all_sessions",
+            "ccbot.session.terminal_manager.list_all_sessions",
             AsyncMock(return_value=sessions),
         ):
             n = await mgr.rebind_unresolved()
@@ -756,10 +758,10 @@ class TestThreadTargets:
         bes = AsyncMock(return_value=True)
         with (
             patch(
-                "ccbot.session.iterm2_manager.list_all_sessions",
+                "ccbot.session.terminal_manager.list_all_sessions",
                 AsyncMock(return_value=[sess]),
             ),
-            patch("ccbot.session.iterm2_manager.bind_existing_session", bes),
+            patch("ccbot.session.terminal_manager.bind_existing_session", bes),
         ):
             n = await mgr.rebind_unresolved()
         assert n == 1

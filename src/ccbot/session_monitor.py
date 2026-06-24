@@ -22,7 +22,7 @@ import aiofiles
 
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
-from .iterm2_manager import iterm2_manager
+from .terminal.manager import terminal_manager
 from .transcript_parser import TranscriptParser
 from .utils import read_cwd_from_jsonl
 
@@ -93,7 +93,7 @@ class SessionMonitor:
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active iTerm2 tabs."""
         cwds = set()
-        windows = await iterm2_manager.list_windows()
+        windows = await terminal_manager.list_windows()
         for w in windows:
             try:
                 cwds.add(str(Path(w.cwd).resolve()))

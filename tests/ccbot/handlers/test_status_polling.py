@@ -51,7 +51,7 @@ class TestStatusPollerSettingsDetection:
         mock_window.window_id = window_id
 
         with (
-            patch("ccbot.handlers.status_polling.iterm2_manager") as mock_iterm,
+            patch("ccbot.handlers.status_polling.terminal_manager") as mock_iterm,
             patch(
                 "ccbot.handlers.status_polling.handle_interactive_ui",
                 new_callable=AsyncMock,
@@ -83,7 +83,7 @@ class TestStatusPollerSettingsDetection:
         )
 
         with (
-            patch("ccbot.handlers.status_polling.iterm2_manager") as mock_iterm,
+            patch("ccbot.handlers.status_polling.terminal_manager") as mock_iterm,
             patch(
                 "ccbot.handlers.status_polling.handle_interactive_ui",
                 new_callable=AsyncMock,
@@ -116,8 +116,8 @@ class TestStatusPollerSettingsDetection:
         mock_window.window_id = window_id
 
         with (
-            patch("ccbot.handlers.status_polling.iterm2_manager") as mock_iterm_poll,
-            patch("ccbot.handlers.interactive_ui.iterm2_manager") as mock_iterm_ui,
+            patch("ccbot.handlers.status_polling.terminal_manager") as mock_iterm_poll,
+            patch("ccbot.handlers.interactive_ui.terminal_manager") as mock_iterm_ui,
             patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
         ):
             mock_iterm_poll.find_window_by_id = AsyncMock(return_value=mock_window)

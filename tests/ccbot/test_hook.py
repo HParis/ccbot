@@ -205,6 +205,7 @@ class TestHookMainItermKey:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
         monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.delenv("CCBOT_SESSION_KEY", raising=False)
         self._run(monkeypatch, self._payload(), iterm_session_id=None)
         assert not (tmp_path / "session_map.json").exists()
 
@@ -275,3 +276,68 @@ class TestHookMainItermKey:
         assert "iterm:OTHER-UUID" in data
         assert "ccbot:@5" in data  # Unit 6 prunes legacy entries on read
         assert f"iterm:{self._ITERM_UUID}" in data
+
+
+class TestHookMainCcbotKey:
+    """Checks for ccbot-injected CCBOT_SESSION_KEY (Otty and other backends)."""
+
+    _CLAUDE_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+    def _payload(self, cwd: str = "/tmp/proj") -> dict:
+        return {
+            "session_id": self._CLAUDE_ID,
+            "cwd": cwd,
+            "hook_event_name": "SessionStart",
+        }
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        payload: dict,
+        *,
+        ccbot_key: str | None,
+        iterm_session_id: str | None = None,
+    ) -> None:
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        monkeypatch.delenv("TMUX_PANE", raising=False)
+        if ccbot_key is None:
+            monkeypatch.delenv("CCBOT_SESSION_KEY", raising=False)
+        else:
+            monkeypatch.setenv("CCBOT_SESSION_KEY", ccbot_key)
+        if iterm_session_id is None:
+            monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+        else:
+            monkeypatch.setenv("ITERM_SESSION_ID", iterm_session_id)
+        hook_main()
+
+    def test_writes_ccbot_key_verbatim(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        self._run(monkeypatch, self._payload(), ccbot_key="otty:p_19ef87d6b65_1")
+
+        data = json.loads((tmp_path / "session_map.json").read_text())
+        assert "otty:p_19ef87d6b65_1" in data
+        assert data["otty:p_19ef87d6b65_1"]["session_id"] == self._CLAUDE_ID
+        assert data["otty:p_19ef87d6b65_1"]["cwd"] == "/tmp/proj"
+
+    def test_ccbot_key_takes_priority_over_iterm(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        self._run(
+            monkeypatch,
+            self._payload(),
+            ccbot_key="otty:p_abc_2",
+            iterm_session_id="w0t1p0:9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB",
+        )
+        data = json.loads((tmp_path / "session_map.json").read_text())
+        assert list(data.keys()) == ["otty:p_abc_2"]
+
+    def test_malformed_ccbot_key_skips(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        self._run(monkeypatch, self._payload(), ccbot_key="no-colon-here")
+        assert not (tmp_path / "session_map.json").exists()

@@ -1,15 +1,18 @@
 """Hook subcommand for Claude Code session tracking.
 
-Called by Claude Code's SessionStart hook to maintain an iTerm2-session
+Called by Claude Code's SessionStart hook to maintain a terminal-session
 ↔ Claude-session mapping in <CCBOT_DIR>/session_map.json. Also provides
 `--install` to auto-configure the hook in ~/.claude/settings.json.
 
-The hook reads ``ITERM_SESSION_ID`` (injected by iTerm2 into every
-shell) to identify which iTerm2 session this Claude instance is
-running in, and writes a key of the form ``iterm:<UUID>`` to the map.
+To identify which terminal session this Claude instance runs in, the hook
+resolves a session_map key (see ``_resolve_session_key``):
+  - ``CCBOT_SESSION_KEY`` — injected by ccbot for backends without a
+    per-session env id (e.g. Otty); used verbatim.
+  - ``ITERM_SESSION_ID`` — iTerm2 injects it into every shell; keyed as
+    ``iterm:<UUID>``.
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
-since hooks run inside iTerm2 sessions where the bot env vars are not
+since hooks run inside terminal sessions where the bot env vars are not
 set. Config directory resolution uses utils.ccbot_dir() (shared with
 config.py).
 
@@ -31,7 +34,45 @@ logger = logging.getLogger(__name__)
 # Validate session_id looks like a UUID
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
+# A ccbot-injected session_map key: "<backend>:<id>" (e.g. "otty:p_19ef_1").
+_CCBOT_KEY_RE = re.compile(r"^[a-z0-9]+:[A-Za-z0-9._-]+$")
+
 _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
+
+
+def _resolve_session_key() -> str | None:
+    """Determine the session_map.json key for the terminal hosting this hook.
+
+    Priority:
+      1. ``CCBOT_SESSION_KEY`` — injected by ccbot at launch for backends with
+         no per-session env id (Otty, ...). Already a full ``<prefix><id>``
+         key; written verbatim so it matches what the bot polls for.
+      2. ``ITERM_SESSION_ID`` — iTerm2 injects ``wXtYpZ:UUID`` into every
+         shell; key on the UUID as ``iterm:<UUID>``.
+
+    Returns None (with a warning) when neither identifies a session.
+    """
+    ccbot_key = os.environ.get("CCBOT_SESSION_KEY", "")
+    if ccbot_key:
+        if _CCBOT_KEY_RE.match(ccbot_key):
+            return ccbot_key
+        logger.warning("CCBOT_SESSION_KEY is malformed: %r", ccbot_key)
+        return None
+
+    iterm_var = os.environ.get("ITERM_SESSION_ID", "")
+    _, _, uuid = iterm_var.partition(":")
+    if not uuid:
+        logger.warning(
+            "No CCBOT_SESSION_KEY, and ITERM_SESSION_ID not set or malformed "
+            "(got %r); cannot determine terminal session",
+            iterm_var,
+        )
+        return None
+    if not _UUID_RE.match(uuid.lower()):
+        logger.warning("ITERM_SESSION_ID UUID is malformed: %s", uuid)
+        return None
+    return f"iterm:{uuid}"
+
 
 # The hook command suffix for detection
 _HOOK_COMMAND_SUFFIX = "ccbot hook"
@@ -190,27 +231,14 @@ def hook_main() -> None:
         logger.debug("Ignoring non-SessionStart event: %s", event)
         return
 
-    # Get the iTerm2 session UUID for the shell running this hook.
-    # iTerm2 injects ITERM_SESSION_ID into every shell it starts; the
-    # value is "wXtYpZ:UUID" (window/tab/pane index, then session UUID).
-    iterm_var = os.environ.get("ITERM_SESSION_ID", "")
-    _, _, uuid = iterm_var.partition(":")
-    if not uuid:
-        logger.warning(
-            "ITERM_SESSION_ID not set or malformed (got %r); "
-            "cannot determine iTerm2 session",
-            iterm_var,
-        )
+    # Resolve which terminal session hosts this hook (CCBOT_SESSION_KEY for
+    # ccbot-launched backends like Otty, else ITERM_SESSION_ID for iTerm2).
+    # The window_name field is left empty — the bot looks up the live name
+    # via its own terminal connection at read time, which is more reliable
+    # than running a query from this short-lived hook subprocess.
+    session_window_key = _resolve_session_key()
+    if session_window_key is None:
         return
-    if not _UUID_RE.match(uuid.lower()):
-        logger.warning("ITERM_SESSION_ID UUID is malformed: %s", uuid)
-        return
-
-    # Key format: "iterm:<UUID>". The window_name field is left empty
-    # — the bot looks up the live name via its own iTerm2 API
-    # connection at read time, which is more reliable than running
-    # an API call from this short-lived hook subprocess.
-    session_window_key = f"iterm:{uuid}"
 
     logger.debug(
         "iterm key=%s, session_id=%s, cwd=%s",

@@ -48,7 +48,7 @@ def main() -> None:
     logging.getLogger("telegram.ext._utils.networkloop").setLevel(logging.DEBUG)
     logger = logging.getLogger(__name__)
 
-    from .iterm2_manager import iterm2_manager
+    from .terminal.manager import terminal_manager
 
     logger.info("Allowed users: %s", config.allowed_users)
     logger.info("Claude projects path: %s", config.claude_projects_path)
@@ -60,12 +60,12 @@ def main() -> None:
     # invalidate it so the bot's own event loop opens a fresh one.
     logger.info("Verifying iTerm2 connectivity...")
     try:
-        asyncio.run(iterm2_manager._get_connection())
+        asyncio.run(terminal_manager.preflight())
     except ConnectionError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
-        iterm2_manager._invalidate_connection()
+        terminal_manager.reset_connection()
     logger.info("iTerm2 connection verified")
 
     logger.info("Starting Telegram bot...")

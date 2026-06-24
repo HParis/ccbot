@@ -33,6 +33,28 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - Every `.py` file starts with a module-level docstring: purpose clear within 10 lines, one-sentence summary first line, then core responsibilities and key components.
 - Telegram interaction: prefer inline keyboards over reply keyboards; use `edit_message_text` for in-place updates; keep callback data under 64 bytes; use `answer_callback_query` for instant feedback.
 
+## Terminal Backends
+
+The host terminal is pluggable (`src/ccbot/terminal/`): a `TerminalBackend`
+Protocol + neutral `TerminalSession` + `Capabilities` flags, backends registered
+by name, selected at startup via `CCBOT_BACKEND` (default `iterm2`). Consumers
+import `terminal_manager` from `ccbot.terminal.manager` — never a concrete backend.
+
+- **iterm2** (default): full capabilities; ownership via `user.ccbot=1`; hook
+  keys on `ITERM_SESSION_ID` → `iterm:<UUID>`.
+- **otty** (`CCBOT_BACKEND=otty`): drives `otty-cli`. Requires the Otty app
+  running and `ipc-allow-send-keys = true` in `~/.config/otty/config.toml`.
+  Capabilities: no ANSI-color capture (monochrome screenshots), no native
+  ownership tag (owned panes tracked in-process + re-resolved by cwd), no
+  reconnect events. Session id = pane id (`p_*`). `create_window` opens a shell
+  tab, then sends `CCBOT_SESSION_KEY=otty:<pane_id> claude …` so the hook can
+  write the key the bot waits on (Otty has no per-pane env id).
+
+Adding a terminal = one backend file + `register("name")`. Capability flags
+drive graceful degradation; never branch on the backend name in upper layers.
+The SessionStart hook is backend-agnostic: it writes `CCBOT_SESSION_KEY` if set,
+else derives the key from `ITERM_SESSION_ID`.
+
 ## Configuration
 
 - Config directory: `~/.ccbot/` by default, override with `CCBOT_DIR` env var.

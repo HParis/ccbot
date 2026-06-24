@@ -138,7 +138,7 @@ from .handlers.status_polling import status_poll_loop
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
-from .iterm2_manager import iterm2_manager
+from .terminal.manager import terminal_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
 from .utils import ccbot_dir
@@ -235,13 +235,13 @@ async def screenshot_command(
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
-    w = await iterm2_manager.find_window_by_id(wid)
+    w = await terminal_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
 
-    png_bytes = await iterm2_manager.screenshot_session(w.window_id)
+    png_bytes = await terminal_manager.screenshot_session(w.window_id)
     if png_bytes is None:
         await safe_reply(
             update.message,
@@ -308,14 +308,14 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
-    w = await iterm2_manager.find_window_by_id(wid)
+    w = await terminal_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
 
     # Send Escape control character (no enter)
-    await iterm2_manager.send_keys(w.window_id, "\x1b", enter=False)
+    await terminal_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
@@ -333,19 +333,19 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, "No session bound to this topic.")
         return
 
-    w = await iterm2_manager.find_window_by_id(wid)
+    w = await terminal_manager.find_window_by_id(wid)
     if not w:
         await safe_reply(update.message, f"Window '{wid}' no longer exists.")
         return
 
     # Send /usage command to Claude Code TUI
-    await iterm2_manager.send_keys(w.window_id, "/usage")
+    await terminal_manager.send_keys(w.window_id, "/usage")
     # Wait for the modal to render
     await asyncio.sleep(2.0)
     # Capture the pane content
-    pane_text = await iterm2_manager.capture_pane(w.window_id)
+    pane_text = await terminal_manager.capture_pane(w.window_id)
     # Dismiss the modal
-    await iterm2_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+    await terminal_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
 
     if not pane_text:
         await safe_reply(update.message, "Failed to capture usage info.")
@@ -434,9 +434,9 @@ async def topic_closed_handler(
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid:
         display = session_manager.get_display_name(wid)
-        w = await iterm2_manager.find_window_by_id(wid)
+        w = await terminal_manager.find_window_by_id(wid)
         if w:
-            await iterm2_manager.kill_window(w.window_id)
+            await terminal_manager.kill_window(w.window_id)
             logger.info(
                 "Topic closed: killed window %s (user=%d, thread=%d)",
                 display,
@@ -493,7 +493,7 @@ async def topic_edited_handler(
         return
 
     old_name = session_manager.get_display_name(wid)
-    await iterm2_manager.rename_window(wid, new_name)
+    await terminal_manager.rename_window(wid, new_name)
     session_manager.update_display_name(wid, new_name)
     logger.info(
         "Topic renamed: '%s' -> '%s' (window=%s, user=%d, thread=%d)",
@@ -532,7 +532,7 @@ async def forward_command_handler(
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
-    w = await iterm2_manager.find_window_by_id(wid)
+    w = await terminal_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
@@ -617,7 +617,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    w = await iterm2_manager.find_window_by_id(wid)
+    w = await terminal_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
@@ -698,7 +698,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    w = await iterm2_manager.find_window_by_id(wid)
+    w = await terminal_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
@@ -772,7 +772,7 @@ async def _capture_bash_output(
         last_output: str = ""
 
         for _ in range(30):
-            raw = await iterm2_manager.capture_pane(window_id)
+            raw = await terminal_manager.capture_pane(window_id)
             if raw is None:
                 return
 
@@ -916,7 +916,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # browser only when nothing adoptable is open.
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         known_claude_uuids = set(session_manager._load_session_map_by_window().keys())
-        all_sessions = await iterm2_manager.list_all_sessions(known_claude_uuids)
+        all_sessions = await terminal_manager.list_all_sessions(known_claude_uuids)
         candidates = [s for s in all_sessions if s.window_id not in bound_ids]
         logger.debug(
             "Tab picker check: all=%d, bound=%d, candidates=%s",
@@ -978,11 +978,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     # Bound topic — forward to bound window
-    w = await iterm2_manager.find_window_by_id(wid)
+    w = await terminal_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
         # Try auto-rebind: find unbound window with same name
-        all_windows = await iterm2_manager.list_windows()
+        all_windows = await terminal_manager.list_windows()
         bound_wids = {
             bw for _, _, bw in session_manager.iter_thread_bindings() if bw != wid
         }
@@ -1046,7 +1046,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # capture_pane is a local iTerm2 call, but handle_interactive_ui hits the
     # network — isolate the whole block so a failure can't prevent the injection.
     try:
-        pane_text = await iterm2_manager.capture_pane(w.window_id)
+        pane_text = await terminal_manager.capture_pane(w.window_id)
         if pane_text and is_interactive_ui(pane_text):
             # UI detected — show it to user, then send text (acts as Enter)
             logger.info(
@@ -1100,7 +1100,7 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
-    success, message, created_wname, created_wid = await iterm2_manager.create_window(
+    success, message, created_wname, created_wid = await terminal_manager.create_window(
         selected_path, resume_session_id=resume_session_id
     )
     if success:
@@ -1258,7 +1258,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Invalid data")
             return
 
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
             await send_history(
                 query,
@@ -1588,7 +1588,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Adopt the session: tag with user.ccbot=1 + lock its name.
         # After this call find_window_by_id will see it.
-        ok = await iterm2_manager.bind_existing_session(selected_wid, display)
+        ok = await terminal_manager.bind_existing_session(selected_wid, display)
         if not ok:
             await query.answer(
                 f"Tab '{original_name}' is gone — refresh and retry",
@@ -1624,14 +1624,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # bug wiped it) and typing `claude` would land as user input.
         # Discover the session_id ourselves and adopt it instead.
         if not has_claude:
-            tab = await iterm2_manager.find_window_by_id(selected_wid)
+            tab = await terminal_manager.find_window_by_id(selected_wid)
             if tab is not None and tab.pane_current_command == "node-runtime":
                 claimed = await session_manager.claim_running_claude(selected_wid, cwd)
                 if claimed:
                     has_claude = True
 
         if not has_claude:
-            await iterm2_manager.send_keys(selected_wid, "claude")
+            await terminal_manager.send_keys(selected_wid, "claude")
             await safe_edit(
                 query,
                 f"✅ Bound to tab `{display}` — starting Claude…",
@@ -1700,12 +1700,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Screenshot: Refresh
     elif data.startswith(CB_SCREENSHOT_REFRESH):
         window_id = data[len(CB_SCREENSHOT_REFRESH) :]
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if not w:
             await query.answer("Window no longer exists", show_alert=True)
             return
 
-        png_bytes = await iterm2_manager.screenshot_session(w.window_id)
+        png_bytes = await terminal_manager.screenshot_session(w.window_id)
         if png_bytes is None:
             await query.answer(
                 "Screenshot failed. Grant Screen Recording permission to "
@@ -1734,9 +1734,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Up", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1747,9 +1747,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_DOWN):
         window_id = data[len(CB_ASK_DOWN) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Down", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1760,9 +1760,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_LEFT):
         window_id = data[len(CB_ASK_LEFT) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Left", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1773,9 +1773,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_RIGHT):
         window_id = data[len(CB_ASK_RIGHT) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Right", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1786,9 +1786,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_ESC):
         window_id = data[len(CB_ASK_ESC) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Escape", enter=False, literal=False
             )
             await clear_interactive_msg(user.id, context.bot, thread_id)
@@ -1798,9 +1798,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_ENTER):
         window_id = data[len(CB_ASK_ENTER) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Enter", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1811,9 +1811,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_SPACE):
         window_id = data[len(CB_ASK_SPACE) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Space", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1824,9 +1824,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_TAB):
         window_id = data[len(CB_ASK_TAB) :]
         thread_id = _get_thread_id(update)
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if w:
-            await iterm2_manager.send_keys(
+            await terminal_manager.send_keys(
                 w.window_id, "Tab", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
@@ -1856,19 +1856,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         key_text, enter, literal = key_info
-        w = await iterm2_manager.find_window_by_id(window_id)
+        w = await terminal_manager.find_window_by_id(window_id)
         if not w:
             await query.answer("Window not found", show_alert=True)
             return
 
-        await iterm2_manager.send_keys(
+        await terminal_manager.send_keys(
             w.window_id, key_text, enter=enter, literal=literal
         )
         await query.answer(_KEY_LABELS.get(key_id, key_id))
 
         # Refresh screenshot after key press
         await asyncio.sleep(0.5)
-        png_bytes = await iterm2_manager.screenshot_session(w.window_id)
+        png_bytes = await terminal_manager.screenshot_session(w.window_id)
         if png_bytes is not None:
             keyboard = _build_screenshot_keyboard(window_id)
             try:
@@ -2029,7 +2029,7 @@ async def post_init(application: Application) -> None:
             logger.info("Auto-rebound %d topic(s) to live tabs by target", rebound)
 
     await _resolve_and_rebind()
-    iterm2_manager.add_reconnect_listener(_resolve_and_rebind)
+    terminal_manager.add_reconnect_listener(_resolve_and_rebind)
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
