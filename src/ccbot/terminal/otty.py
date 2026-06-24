@@ -45,6 +45,11 @@ logger = logging.getLogger(__name__)
 # Bundled CLI location used when neither config nor PATH resolves one.
 _BUNDLE_CLI = "/Applications/Otty.app/Contents/MacOS/otty-cli"
 
+# Used to auto-launch the app (backgrounded) when it isn't running, mirroring
+# the iTerm2 backend. Waits between `open` and re-pinging the control socket.
+_OTTY_BUNDLE_ID = "io.appmakes.otty"
+_LAUNCH_DELAYS: tuple[float, ...] = (1.5, 2.0, 3.0, 4.0)
+
 # Otty pane ids look like ``p_19ef87d6b65_1`` (used as session_map suffixes).
 _PANE_ID_RE = re.compile(r"^p_[0-9a-z]+_\d+$")
 
@@ -143,14 +148,37 @@ class OttyManager:
         """An Otty session id is a pane id like ``p_19ef87d6b65_1``."""
         return bool(_PANE_ID_RE.match(candidate))
 
+    async def _ping(self) -> bool:
+        """Cheap reachability probe against the control socket."""
+        return await self._run_json("window", "list") is not None
+
+    async def _launch_app(self) -> None:
+        """Launch the Otty app in the background (no focus steal)."""
+        try:
+            await self._runner(["/usr/bin/open", "-g", "-b", _OTTY_BUNDLE_ID])
+        except Exception as e:
+            logger.warning("Failed to launch Otty: %s", e)
+
     async def preflight(self) -> None:
-        """Verify Otty is reachable, raising ConnectionError if not."""
-        res = await self._run_json("window", "list")
-        if res is None:
-            raise ConnectionError(
-                "Otty is not reachable. Make sure the Otty app is running and "
-                f"otty-cli is available at {self._cli!r}."
-            )
+        """Verify Otty is reachable, auto-launching it if needed.
+
+        Mirrors the iTerm2 backend: if the app isn't up, ``open`` it
+        (backgrounded) and retry the control-socket ping before giving up.
+        """
+        if await self._ping():
+            return
+        logger.info("Otty not reachable; attempting to launch it…")
+        await self._launch_app()
+        for delay in _LAUNCH_DELAYS:
+            await _sleep(delay)
+            if await self._ping():
+                logger.info("Otty became reachable after launch")
+                return
+        raise ConnectionError(
+            "Otty is not reachable. Make sure Otty is installed and otty-cli "
+            f"is available at {self._cli!r}, and that ipc-allow-send-keys = true "
+            "in ~/.config/otty/config.toml."
+        )
 
     def reset_connection(self) -> None:
         """No persistent connection; nothing to reset."""

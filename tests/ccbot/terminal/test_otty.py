@@ -87,7 +87,9 @@ def test_registered_in_registry() -> None:
     assert "otty" in registry.available()
 
 
-async def test_preflight_raises_when_unreachable() -> None:
+async def test_preflight_raises_when_unreachable(monkeypatch) -> None:
+    monkeypatch.setattr("ccbot.terminal.otty._LAUNCH_DELAYS", (0.0,))
+
     async def dead(args: list[str]) -> tuple[int, str, str]:
         return _fail(rc=1, err="no app")
 
@@ -95,6 +97,25 @@ async def test_preflight_raises_when_unreachable() -> None:
     with pytest.raises(ConnectionError):
         await mgr.preflight()
     assert mgr.is_reachable() is False
+
+
+async def test_preflight_auto_launches_then_succeeds(monkeypatch) -> None:
+    monkeypatch.setattr("ccbot.terminal.otty._LAUNCH_DELAYS", (0.0, 0.0))
+    state = {"up": False, "opened": False}
+
+    async def runner(args: list[str]) -> tuple[int, str, str]:
+        if args[:2] == ["/usr/bin/open", "-g"]:
+            state["opened"] = True
+            state["up"] = True  # app comes up after launch
+            return 0, "", ""
+        # window list ping
+        if not state["up"]:
+            return _fail(rc=1, err="no app")
+        return _ok([{"id": "w_1"}])
+
+    mgr = OttyManager(cli_path="/fake/otty-cli", socket_path="", runner=runner)
+    await mgr.preflight()  # must not raise
+    assert state["opened"] is True
 
 
 async def test_list_windows_only_returns_owned_panes() -> None:
