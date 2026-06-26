@@ -98,6 +98,19 @@ UI_PATTERNS: list[UIPattern] = [
         bottom=(re.compile(r"^\s*Esc to cancel"),),
     ),
     UIPattern(
+        # Computer Use screen-control consent dialog. App list uses ◉/○
+        # toggles (Space), confirm via a numbered ❯ menu ("Allow…"/"Deny…").
+        # Bottom line is "Enter to confirm · Esc to cancel" — note "Esc to
+        # cancel" sits mid-line, so the anchored PermissionPrompt bottom
+        # never catches it.
+        name="ComputerUse",
+        top=(re.compile(r"^\s*Computer Use wants to control"),),
+        bottom=(
+            re.compile(r"Enter to confirm"),
+            re.compile(r"Esc to cancel"),
+        ),
+    ),
+    UIPattern(
         name="RestoreCheckpoint",
         top=(re.compile(r"^\s*Restore the code"),),
         bottom=(re.compile(r"^\s*Enter to continue"),),
@@ -119,6 +132,20 @@ UI_PATTERNS: list[UIPattern] = [
 
 
 # ── Post-processing ──────────────────────────────────────────────────────
+
+
+def _normalize_pane(text: str) -> str:
+    """Replace NUL bytes with spaces in captured pane text.
+
+    iTerm2 renders unset/blank cells as NUL (``\\x00``), and these land
+    *inside* lines — e.g. ``' \\x00Computer Use wants to control…'`` or
+    ``'\\x00\\x00Enter to confirm'``.  NUL is not whitespace, so any
+    line-anchored ``^\\s*`` pattern (and the status-line spinner check)
+    silently fails to match.  Mapping NUL → space restores the visual
+    blank the cell represents and makes matching robust.
+    """
+    return text.replace("\x00", " ")
+
 
 _RE_LONG_DASH = re.compile(r"^─{5,}$")
 
@@ -180,7 +207,7 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
     if not pane_text:
         return None
 
-    lines = pane_text.strip().split("\n")
+    lines = _normalize_pane(pane_text).strip().split("\n")
     for pattern in UI_PATTERNS:
         result = _try_extract(lines, pattern)
         if result:
@@ -212,7 +239,7 @@ def parse_status_line(pane_text: str) -> str | None:
     if not pane_text:
         return None
 
-    lines = pane_text.split("\n")
+    lines = _normalize_pane(pane_text).split("\n")
 
     # Find the chrome separator: topmost ──── line in the last 10 lines
     chrome_idx: int | None = None

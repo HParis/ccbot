@@ -101,6 +101,48 @@ class TestExtractInteractiveContent:
         assert result.name == "PermissionPrompt"
         assert "Do you want to proceed?" in result.content
 
+    def test_computer_use(self):
+        # Real capture from a "Calling computer-use…" Simulator consent prompt.
+        pane = (
+            "⏺ Calling computer-use…\n"
+            "\n"
+            "─────\n"
+            "  Computer Use wants to control these apps\n"
+            "\n"
+            "\n"
+            "   在 iOS 模拟器窗口上对 Quin App 的 Logo 做 5 连点，验证调试页(DebugView)能正确弹出。\n"
+            "\n"
+            "     ◉ Simulator          \n"
+            "\n"
+            "   ❯ 1. Allow for this session (1 app)\n"
+            "     2. Deny, and tell Claude what to do differently (esc)\n"
+            "  \n"
+            "  Enter to confirm · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ComputerUse"
+        assert "Computer Use wants to control" in result.content
+        assert "Allow for this session" in result.content
+        assert "Enter to confirm" in result.content
+
+    def test_computer_use_with_nul_cells(self):
+        # iTerm2 renders blank cells as NUL *inside* lines — these defeat
+        # ^\s* anchoring unless normalized. Mirrors the real capture exactly.
+        pane = (
+            "─────\n"
+            " \x00Computer Use wants to control these apps\n"
+            "\n"
+            "   在模拟器窗口对 Logo 做 5 连点。\n"
+            "     ◉ Simulator          \n"
+            "  \x00❯\x001. Allow for this session (1 app)\n"
+            "     2. Deny, and tell Claude what to do differently (esc)\n"
+            "\x00\x00Enter to confirm · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ComputerUse"
+
     def test_restore_checkpoint(self):
         pane = (
             "  Restore the code to a previous state?\n"
