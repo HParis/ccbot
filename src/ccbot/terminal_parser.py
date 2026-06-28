@@ -111,6 +111,17 @@ UI_PATTERNS: list[UIPattern] = [
         ),
     ),
     UIPattern(
+        # /mcp "Manage MCP servers" modal — same ❯-list + footer family as
+        # the Computer Use dialog (footer: "↑/↓ to navigate · Enter to
+        # confirm · Esc to cancel", both markers mid-line).
+        name="ManageMCP",
+        top=(re.compile(r"^\s*Manage MCP servers"),),
+        bottom=(
+            re.compile(r"Enter to confirm"),
+            re.compile(r"Esc to cancel"),
+        ),
+    ),
+    UIPattern(
         name="RestoreCheckpoint",
         top=(re.compile(r"^\s*Restore the code"),),
         bottom=(re.compile(r"^\s*Enter to continue"),),

@@ -143,6 +143,28 @@ class TestExtractInteractiveContent:
         assert result is not None
         assert result.name == "ComputerUse"
 
+    def test_manage_mcp(self):
+        # Real capture from `/mcp` "Manage MCP servers" modal.
+        pane = (
+            "▔▔▔▔▔\n"
+            "   Manage MCP servers\n"
+            "   6 servers\n"
+            "\n"
+            "     User MCPs (/Users/paris/.claude.json)\n"
+            "   ❯ XcodeBuildMCP · ✔ connected · 52 tools\n"
+            "\n"
+            "     Built-in MCPs (always available)\n"
+            "     computer-use · ◯ disabled\n"
+            "\n"
+            "   https://code.claude.com/docs/en/mcp for help\n"
+            "   ↑/↓ to navigate · Enter to confirm · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ManageMCP"
+        assert "Manage MCP servers" in result.content
+        assert "XcodeBuildMCP" in result.content
+
     def test_restore_checkpoint(self):
         pane = (
             "  Restore the code to a previous state?\n"
