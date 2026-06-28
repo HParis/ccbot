@@ -158,14 +158,61 @@ def _normalize_pane(text: str) -> str:
     return text.replace("\x00", " ")
 
 
-_RE_LONG_DASH = re.compile(r"^─{5,}$")
+_RE_LONG_DASH = re.compile(r"^[─▔━]{5,}$")
+
+# Full-width bar characters Claude Code uses to frame modal screens.
+_BAR_CHARS = frozenset("─▔━╌┄")
+
+# Footer "key hint" line at the bottom of a Claude Code modal, e.g.
+# "↑/↓ to navigate · Enter to select · Esc to back". Wording varies per
+# screen (confirm/select/continue/save, cancel/back/exit/close), so match
+# the action verbs rather than a fixed phrase.
+_RE_MODAL_FOOTER = re.compile(
+    r"(↑/↓ to navigate|Enter to (confirm|select|continue|save)"
+    r"|Esc to (cancel|back|exit|close))"
+)
 
 
 def _shorten_separators(text: str) -> str:
-    """Replace lines of 5+ ─ characters with exactly ─────."""
+    """Replace lines of 5+ bar characters with exactly ─────."""
     return "\n".join(
         "─────" if _RE_LONG_DASH.match(line) else line for line in text.split("\n")
     )
+
+
+def _extract_generic_modal(lines: list[str]) -> InteractiveUIContent | None:
+    """Fallback detector for any Claude Code modal screen.
+
+    Catches the long tail of full-screen pickers (e.g. /mcp server detail,
+    future settings sub-screens) without a dedicated pattern per screen.
+    A modal is recognised when the last non-blank line is a key-hint footer
+    (:data:`_RE_MODAL_FOOTER`) and a full-width separator bar sits above it;
+    the region between them is the modal body.
+
+    This cannot misfire on normal output: when Claude is idle or working the
+    pane's last line is its bottom chrome (``⏵⏵ bypass permissions…``), never
+    a footer hint — the modal replaces that chrome while it is open.
+    """
+    last_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            last_idx = i
+            break
+    if last_idx is None or not _RE_MODAL_FOOTER.search(lines[last_idx]):
+        return None
+
+    # Nearest separator bar above the footer marks the top of the modal.
+    top_idx: int | None = None
+    for i in range(last_idx - 1, -1, -1):
+        stripped = lines[i].strip()
+        if len(stripped) >= 5 and set(stripped) <= _BAR_CHARS:
+            top_idx = i
+            break
+    if top_idx is None or last_idx - top_idx < 2:
+        return None
+
+    content = "\n".join(lines[top_idx : last_idx + 1]).rstrip()
+    return InteractiveUIContent(content=_shorten_separators(content), name="Modal")
 
 
 # ── Core extraction ──────────────────────────────────────────────────────
@@ -223,7 +270,8 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
         result = _try_extract(lines, pattern)
         if result:
             return result
-    return None
+    # Fallback: catch any modal screen not covered by an explicit pattern.
+    return _extract_generic_modal(lines)
 
 
 def is_interactive_ui(pane_text: str) -> bool:

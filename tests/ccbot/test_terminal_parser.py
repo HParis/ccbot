@@ -165,6 +165,41 @@ class TestExtractInteractiveContent:
         assert "Manage MCP servers" in result.content
         assert "XcodeBuildMCP" in result.content
 
+    def test_generic_modal_mcp_server_detail(self):
+        # Real capture: /mcp → select a server → detail sub-page. Footer is
+        # "Enter to select · Esc to back" (not confirm/cancel) and the title
+        # is server-specific, so only the generic fallback catches it.
+        pane = (
+            "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+            "   Computer-use MCP Server\n"
+            "\n"
+            "   Status:           ◯ disabled\n"
+            "   Command:          /Users/paris/.local/share/claude/versions/2.1.193\n"
+            "   Args:             --computer-use-mcp\n"
+            "   Config location:  Dynamically configured\n"
+            "\n"
+            "   ❯ 1. Enable\n"
+            "\n"
+            "   ↑/↓ to navigate · Enter to select · Esc to back\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "Modal"
+        assert "Computer-use MCP Server" in result.content
+        assert "Enable" in result.content
+
+    def test_generic_modal_not_triggered_on_normal_pane(self):
+        # Normal idle pane ends in bottom chrome, never a footer hint → no UI.
+        pane = (
+            "⏺ Some assistant output mentioning Esc to cancel in prose.\n"
+            "─────────────────────────────────────────\n"
+            "❯ \n"
+            "─────────────────────────────────────────\n"
+            "  [Opus 4.8] Context: 34%\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        assert extract_interactive_content(pane) is None
+
     def test_restore_checkpoint(self):
         pane = (
             "  Restore the code to a previous state?\n"
