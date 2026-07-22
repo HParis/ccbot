@@ -13,7 +13,6 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
-from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
 
@@ -72,14 +71,12 @@ def build_response_parts(
             return [f"{prefix}{separator}{text}"]
         return [text]
 
-    # Convert tables to card-style before splitting so tables aren't broken
-    # across messages. The send layer's convert_markdown() call is idempotent.
-    text = convert_markdown_tables(text)
-
-    # Split first, then assemble each chunk.
     # Use conservative max to leave room for MarkdownV2 expansion at send layer.
     max_text = 3000 - len(prefix) - len(separator)
 
+    # split_message keeps pipe tables intact within a chunk, so raw tables reach
+    # the send layer (and render as Rich Messages) even across a multi-part
+    # split — no need to flatten them to cards here.
     text_chunks = split_message(text, max_length=max_text)
     total = len(text_chunks)
 

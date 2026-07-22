@@ -31,6 +31,7 @@ from telegram import (
 from telegram.error import RetryAfter
 
 from ..markdown_v2 import convert_markdown
+from ..rich_message import markdown_to_rich_blocks
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,69 @@ async def send_with_fallback(
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
             return None
+
+
+async def send_rich_message(
+    bot: Bot,
+    chat_id: int,
+    blocks: list[dict],
+    message_thread_id: int | None = None,
+    **kwargs: Any,
+) -> Message | None:
+    """Send a Bot API 10.2 Rich Message via PTB's do_api_request escape hatch.
+
+    PTB 22.6 has no native `sendRichMessage` wrapper; `do_api_request` forwards
+    the call while reusing PTB's auth, request pool, and AIORateLimiter. `blocks`
+    is a list of InputRichBlock dicts — build them with
+    `rich_message.markdown_to_rich_blocks`.
+
+    Returns the sent Message, or None on failure. RetryAfter is re-raised for
+    the queue worker to handle.
+    """
+    if not blocks:
+        return None
+    if message_thread_id is not None:
+        kwargs.setdefault("message_thread_id", message_thread_id)
+    try:
+        return await bot.do_api_request(
+            "sendRichMessage",
+            api_kwargs={
+                "chat_id": chat_id,
+                "rich_message": {"blocks": blocks},
+                **kwargs,
+            },
+            return_type=Message,
+        )
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error("Failed to send rich message to %d: %s", chat_id, e)
+        return None
+
+
+async def send_markdown_as_rich(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    message_thread_id: int | None = None,
+    **kwargs: Any,
+) -> Message | None:
+    """Render Markdown to rich blocks and send, falling back to plain send.
+
+    Renders `text` (tables/headings/lists/math + inline styles) into a Rich
+    Message. If rendering yields nothing or the rich send fails, falls back to
+    the normal MarkdownV2 `send_with_fallback` path so no message is lost.
+    """
+    blocks = markdown_to_rich_blocks(text)
+    if blocks:
+        sent = await send_rich_message(
+            bot, chat_id, blocks, message_thread_id=message_thread_id, **kwargs
+        )
+        if sent is not None:
+            return sent
+    return await send_with_fallback(
+        bot, chat_id, text, message_thread_id=message_thread_id, **kwargs
+    )
 
 
 def _filename_for(media_type: str, index: int) -> str:

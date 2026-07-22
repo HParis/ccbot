@@ -120,3 +120,37 @@ class TestSplitMessage:
         for chunk in chunks:
             fence_count = chunk.count("```")
             assert fence_count % 2 == 0, f"Unbalanced fences in: {chunk!r}"
+
+
+class TestTableAtomicity:
+    def test_table_not_split_mid_table(self):
+        """A pipe table that fits a chunk stays whole across a forced split."""
+        pre = "x" * 40
+        table = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+        text = f"{pre}\n{table}"
+        chunks = split_message(text, max_length=50)
+        # The whole table must appear intact inside exactly one chunk.
+        assert any(table in c for c in chunks)
+
+    def test_table_moves_to_new_chunk_when_it_would_overflow(self):
+        """When the table doesn't fit with preceding text, it starts fresh."""
+        pre = "y" * 45
+        table = "| a | b |\n| --- | --- |\n| 1 | 2 |"
+        chunks = split_message(f"{pre}\n{table}", max_length=50)
+        assert len(chunks) == 2
+        assert chunks[0] == pre
+        assert chunks[1] == table
+
+    def test_oversized_table_degrades_to_line_split(self):
+        """A single table larger than a chunk falls back to per-line splitting."""
+        rows = "\n".join(f"| {'z' * 40} | {i} |" for i in range(10))
+        table = f"| h1 | h2 |\n| --- | --- |\n{rows}"
+        chunks = split_message(table, max_length=60)
+        assert len(chunks) > 1
+        assert all(len(c) <= 60 for c in chunks)
+
+    def test_table_and_following_text_separate(self):
+        table = "| a | b |\n| --- | --- |\n| 1 | 2 |"
+        text = f"{table}\n{'w' * 45}"
+        chunks = split_message(text, max_length=50)
+        assert any(table in c for c in chunks)

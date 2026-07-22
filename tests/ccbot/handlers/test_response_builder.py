@@ -58,3 +58,23 @@ class TestBuildResponseParts:
         assert len(parts) == 1
         assert "\U0001f464" not in parts[0]
         assert "Thinking" not in parts[0]
+
+    def test_short_table_kept_raw_for_rich_rendering(self):
+        # A pipe table under the split limit must survive intact so the send
+        # layer can render it as a Rich Message — not be pre-carded here.
+        text = "| a | b |\n| --- | --- |\n| 1 | 2 |"
+        parts = build_response_parts(text, is_complete=True, content_type="text")
+        assert len(parts) == 1
+        assert "| a | b |" in parts[0]
+        assert "────" not in parts[0]  # not carded
+
+    def test_oversized_table_splits_without_carding(self):
+        # Too big for one part: splits across parts, but rows stay as raw pipes
+        # (no card-style flattening) — the send layer decides rendering.
+        rows = "\n".join(f"| {'x' * 80} | {i} |" for i in range(80))
+        text = f"| h1 | h2 |\n| --- | --- |\n{rows}"
+        parts = build_response_parts(text, is_complete=True, content_type="text")
+        assert len(parts) > 1
+        assert "1/" in parts[0]
+        assert "────" not in "".join(parts)  # not carded
+        assert "| x" in parts[0]  # raw pipe rows preserved

@@ -31,9 +31,12 @@ from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..terminal.manager import terminal_manager
+from ..rich_message import contains_rich_blocks
+from ..transcript_parser import TranscriptParser
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
+    send_markdown_as_rich,
     send_photo,
     send_with_fallback,
     strip_sentinels,
@@ -350,26 +353,49 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     for part in task.parts:
         sent = None
 
-        # For first part, try to convert status message to content (edit instead of delete)
+        # Rich Messages (tables/headings/lists/math) are send-only — they can't
+        # be produced by editing a text status message, and tool_use/tool_result
+        # rely on later edits. Expandable-quote sentinels (thinking) have no rich
+        # representation, so restrict the rich path to assistant "text" parts
+        # free of sentinels.
+        use_rich = (
+            task.content_type == "text"
+            and TranscriptParser.EXPANDABLE_QUOTE_START not in part
+            and contains_rich_blocks(part)
+        )
+
+        # For first part, try to convert status message to content (edit instead
+        # of delete). A rich part can't be edited in, so clear the status first.
         if first_part:
             first_part = False
-            converted_msg_id = await _convert_status_to_content(
-                bot,
-                user_id,
-                tid,
-                wid,
-                part,
-            )
-            if converted_msg_id is not None:
-                last_msg_id = converted_msg_id
-                continue
+            if use_rich:
+                await _do_clear_status_message(bot, user_id, tid)
+            else:
+                converted_msg_id = await _convert_status_to_content(
+                    bot,
+                    user_id,
+                    tid,
+                    wid,
+                    part,
+                )
+                if converted_msg_id is not None:
+                    last_msg_id = converted_msg_id
+                    continue
 
-        sent = await send_with_fallback(
-            bot,
-            chat_id,
-            part,
-            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
-        )
+        if use_rich:
+            sent = await send_markdown_as_rich(
+                bot,
+                chat_id,
+                part,
+                **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+            )
+        else:
+            sent = await send_with_fallback(
+                bot,
+                chat_id,
+                part,
+                **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+            )
 
         if sent:
             last_msg_id = sent.message_id
