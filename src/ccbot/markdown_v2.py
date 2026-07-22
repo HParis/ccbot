@@ -116,10 +116,11 @@ def _escape_mdv2(text: str) -> str:
     return _MDV2_ESCAPE_RE.sub(r"\\\1", text)
 
 
-# Max rendered chars for a single expandable quote block.
-# Leaves room for surrounding text within the 8000 split limit (see
+# Max rendered chars for a single expandable quote block. Expandable quotes are
+# sent atomically (never split), so this must stay within Telegram's per-message
+# limit; leaves room for surrounding text under the 4096 split limit (see
 # telegram_sender.TELEGRAM_MAX_MESSAGE_LENGTH).
-_EXPQUOTE_MAX_RENDERED = 7400
+_EXPQUOTE_MAX_RENDERED = 3500
 
 
 def _render_expandable_quote(m: re.Match[str]) -> str:

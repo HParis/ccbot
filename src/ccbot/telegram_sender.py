@@ -1,34 +1,56 @@
-"""Message splitting utility for Telegram's per-message character limit.
+"""Message splitting utility for Telegram's 4096-character limit.
 
 Provides:
-  - split_message(): splits long text into Telegram-safe chunks, preferring
-    newline boundaries and preserving code block integrity.
+  - utf16_len(): message length in UTF-16 code units (Telegram's accounting).
+  - split_message(): splits long text into Telegram-safe chunks (≤4096 UTF-16
+    units), preferring newline boundaries and preserving code block integrity.
 
-Telegram raised the bot message limit from 4096 to 32768 chars (2026), with a
-client-side "Show More" fold past ~8000 rendered chars. We split at 8000 so
-each relayed chunk stays a single unfolded message while drastically reducing
-the [1/N] fragmentation of long Claude output. Splitting happens on raw
-markdown; MarkdownV2 escaping expands it slightly, but stays far under 32768.
-
-Fenced code blocks and GFM pipe tables are kept intact across the split — a
-code block is closed/reopened at chunk boundaries, and a table that fits in a
-chunk is never cut mid-table (so the send layer can still render it as a Rich
-Message). A single table larger than one chunk is the one case that degrades to
-per-line splitting.
+Fenced code blocks are closed/reopened at chunk boundaries so each chunk stays
+valid markdown. A GFM pipe table that fits in a chunk is kept whole (never cut
+mid-table) so the send layer can still render it as a Rich Message; only a
+single table larger than one chunk degrades to per-line splitting.
 """
 
 import re
 
-# Raw-markdown split size. Kept at the ~8000 client fold threshold so rendered
-# messages stay unfolded for typical content (escaping adds little for prose).
-TELEGRAM_MAX_MESSAGE_LENGTH = 8000
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+# Headroom reserved inside code blocks so the closing "\n```" always fits
+_FENCE_CLOSE_RESERVE = 4
 
 # A GFM table separator row, e.g. "| --- | :---: |".
 _TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$")
 
 
+def utf16_len(text: str) -> int:
+    """Length in UTF-16 code units — how Telegram counts message length.
+
+    Characters outside the BMP (emoji, some CJK extensions) occupy two
+    UTF-16 code units; Python's len() counts them as one code point.
+    """
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in text)
+
+
 def _is_table_separator(line: str) -> bool:
     return "-" in line and bool(_TABLE_SEPARATOR_RE.match(line))
+
+
+def _force_split(line: str, budget: int) -> list[str]:
+    """Split a single overlong line into pieces within a UTF-16 budget."""
+    pieces: list[str] = []
+    piece = ""
+    piece_len = 0
+    for ch in line:
+        ch_len = 2 if ord(ch) > 0xFFFF else 1
+        if piece_len + ch_len > budget:
+            pieces.append(piece)
+            piece, piece_len = ch, ch_len
+        else:
+            piece += ch
+            piece_len += ch_len
+    if piece:
+        pieces.append(piece)
+    return pieces
 
 
 def split_message(
@@ -36,18 +58,35 @@ def split_message(
 ) -> list[str]:
     """Split a message into chunks that fit Telegram's length limit.
 
-    Tries to split on newlines when possible to preserve formatting.
+    Lengths are measured in UTF-16 code units (Telegram's limit), not code
+    points. Tries to split on newlines when possible to preserve formatting.
     When a split occurs inside a fenced code block (```), the block is
     closed at the end of the current chunk and re-opened at the start
-    of the next chunk so each chunk remains valid markdown.
+    of the next chunk so each chunk remains valid markdown. A pipe table that
+    fits a chunk is kept intact so the send layer can render it richly.
     """
-    if len(text) <= max_length:
+    if utf16_len(text) <= max_length:
         return [text]
 
     chunks: list[str] = []
     current_chunk = ""
+    current_len = 0
+    # Code-block state BEFORE the line being placed: a fence line toggles the
+    # state only after it has been assigned to a chunk, so a flush never
+    # appends a closing fence to a chunk that contains no opening fence.
     in_code_block = False
     code_fence = ""  # e.g. "```python"
+
+    def flush() -> None:
+        nonlocal current_chunk, current_len
+        chunk_text = current_chunk.rstrip("\n")
+        if chunk_text:
+            if in_code_block:
+                # Close the open code block before flushing
+                chunk_text += "\n```"
+            chunks.append(chunk_text)
+        current_chunk = ""
+        current_len = 0
 
     lines = text.split("\n")
     n = len(lines)
@@ -55,6 +94,7 @@ def split_message(
     while i < n:
         line = lines[i]
         stripped = line.strip()
+        is_fence = stripped.startswith("```")
 
         # Keep a whole pipe table (header + separator + body) in one chunk so
         # the send layer can render it as a Rich Message. Only when the table
@@ -69,48 +109,54 @@ def split_message(
             while j < n and lines[j].strip() and "|" in lines[j]:
                 j += 1
             table = "\n".join(lines[i:j])
-            if len(table) <= max_length:
-                if current_chunk and len(current_chunk) + len(table) + 1 > max_length:
-                    chunks.append(current_chunk.rstrip("\n"))
-                    current_chunk = ""
+            table_len = utf16_len(table)
+            if table_len <= max_length:
+                if current_chunk and current_len + table_len + 1 > max_length:
+                    flush()
                 current_chunk += table + "\n"
+                current_len += table_len + 1
                 i = j
                 continue
             # else: table too big to keep atomic — fall through to line logic.
 
-        # Track code block state
-        if stripped.startswith("```"):
-            if not in_code_block:
-                in_code_block = True
-                code_fence = stripped  # remember "```lang"
-            else:
-                in_code_block = False
+        line_len = utf16_len(line)
+        # Inside a code block, reserve room for the closing "\n```"
+        reserve = _FENCE_CLOSE_RESERVE if in_code_block else 0
 
         # If single line exceeds max, split it forcefully
-        if len(line) > max_length:
-            if current_chunk:
-                chunk_text = current_chunk.rstrip("\n")
-                if in_code_block:
-                    # The long line is inside a code block; close before flush
-                    chunk_text += "\n```"
-                chunks.append(chunk_text)
-                current_chunk = (code_fence + "\n") if in_code_block else ""
-            # Split long line into fixed-size pieces
-            for k in range(0, len(line), max_length):
-                chunks.append(line[k : k + max_length])
-        elif len(current_chunk) + len(line) + 1 > max_length:
-            # Current chunk is full, start a new one
-            chunk_text = current_chunk.rstrip("\n")
+        if line_len > max_length - reserve:
+            flush()
             if in_code_block:
-                chunk_text += "\n```"
-            chunks.append(chunk_text)
+                # Wrap every piece in its own fences so each chunk
+                # renders as a code block on its own
+                overhead = utf16_len(code_fence) + 1 + _FENCE_CLOSE_RESERVE
+                for piece in _force_split(line, max_length - overhead):
+                    chunks.append(f"{code_fence}\n{piece}\n```")
+                # Re-open the block for subsequent lines
+                current_chunk = code_fence + "\n"
+                current_len = utf16_len(current_chunk)
+            else:
+                chunks.extend(_force_split(line, max_length))
+        elif current_len + line_len + 1 > max_length - reserve:
+            # Current chunk is full, start a new one
+            flush()
             # Re-open code block in the new chunk
             if in_code_block:
                 current_chunk = code_fence + "\n" + line + "\n"
             else:
                 current_chunk = line + "\n"
+            current_len = utf16_len(current_chunk)
         else:
             current_chunk += line + "\n"
+            current_len += line_len + 1
+
+        # Toggle code-block state after the line has been placed
+        if is_fence:
+            if not in_code_block:
+                in_code_block = True
+                code_fence = stripped  # remember "```lang"
+            else:
+                in_code_block = False
 
         i += 1
 

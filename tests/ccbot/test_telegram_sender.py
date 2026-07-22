@@ -2,7 +2,7 @@
 
 import pytest
 
-from ccbot.telegram_sender import TELEGRAM_MAX_MESSAGE_LENGTH, split_message
+from ccbot.telegram_sender import split_message, utf16_len
 
 
 class TestSplitMessage:
@@ -11,11 +11,7 @@ class TestSplitMessage:
         [
             pytest.param("hello world", ["hello world"], id="short_text"),
             pytest.param("", [""], id="empty_string"),
-            pytest.param(
-                "a" * TELEGRAM_MAX_MESSAGE_LENGTH,
-                ["a" * TELEGRAM_MAX_MESSAGE_LENGTH],
-                id="exactly_max_chars",
-            ),
+            pytest.param("a" * 4096, ["a" * 4096], id="exactly_4096_chars"),
         ],
     )
     def test_single_chunk_returned(self, text: str, expected: list[str]):
@@ -24,19 +20,17 @@ class TestSplitMessage:
     def test_split_on_newline_boundaries(self):
         line = "x" * 2000
         text = f"{line}\n{line}\n{line}"
-        # Explicit max_length so the test exercises newline-boundary splitting
-        # independent of the default limit.
-        chunks = split_message(text, max_length=4096)
+        chunks = split_message(text)
         assert len(chunks) == 2
         assert chunks[0] == f"{line}\n{line}"
         assert chunks[1] == line
 
     def test_single_long_line_force_split(self):
-        text = "a" * (TELEGRAM_MAX_MESSAGE_LENGTH * 2)
+        text = "a" * 8192
         chunks = split_message(text)
         assert len(chunks) == 2
-        assert chunks[0] == "a" * TELEGRAM_MAX_MESSAGE_LENGTH
-        assert chunks[1] == "a" * TELEGRAM_MAX_MESSAGE_LENGTH
+        assert chunks[0] == "a" * 4096
+        assert chunks[1] == "a" * 4096
 
     def test_custom_max_length(self):
         text = "aaaa\nbbbb\ncccc"
@@ -122,18 +116,77 @@ class TestSplitMessage:
             assert fence_count % 2 == 0, f"Unbalanced fences in: {chunk!r}"
 
 
+class TestUtf16Len:
+    """Telegram counts message length in UTF-16 code units, not code points."""
+
+    def test_ascii(self):
+        assert utf16_len("hello") == 5
+
+    def test_bmp_cjk(self):
+        # CJK in the BMP is one UTF-16 unit per character
+        assert utf16_len("中文") == 2
+
+    def test_emoji_counts_double(self):
+        # Non-BMP characters (surrogate pairs) count as two units
+        assert utf16_len("😀") == 2
+        assert utf16_len("a😀b") == 4
+
+
+class TestSplitMessageUtf16:
+    """split_message must budget by UTF-16 units or emoji-heavy text
+    exceeds Telegram's real limit and the send fails."""
+
+    def test_emoji_text_within_utf16_budget(self):
+        # 3000 emoji = 3000 code points but 6000 UTF-16 units
+        text = "😀" * 3000
+        chunks = split_message(text, max_length=4096)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert utf16_len(chunk) <= 4096
+
+    def test_emoji_lines_within_utf16_budget(self):
+        lines = ["😀" * 50 for _ in range(200)]
+        text = "\n".join(lines)
+        chunks = split_message(text, max_length=500)
+        for chunk in chunks:
+            assert utf16_len(chunk) <= 500
+
+    def test_force_split_never_splits_surrogate_pair(self):
+        # An odd budget with 2-unit chars: pieces must stay whole characters
+        text = "😀" * 100
+        chunks = split_message(text, max_length=51)
+        for chunk in chunks:
+            assert utf16_len(chunk) <= 51
+            # Round-trip through UTF-16 must not raise (no lone surrogates)
+            chunk.encode("utf-16")
+
+
+class TestSplitMessageCodeBlockForceSplit:
+    """Overlong single lines inside a code block keep fence integrity."""
+
+    def test_long_line_in_code_block_gets_fenced_pieces(self):
+        long_line = "x" * 200
+        text = f"```js\n{long_line}\n```"
+        chunks = split_message(text, max_length=60)
+        for chunk in chunks:
+            assert chunk.count("```") % 2 == 0, f"Unbalanced fences in: {chunk!r}"
+            assert utf16_len(chunk) <= 60
+        # The forced pieces are wrapped as standalone code blocks
+        assert any(c.startswith("```js\nx") and c.endswith("```") for c in chunks)
+
+
 class TestTableAtomicity:
+    """A pipe table that fits a chunk must never be cut mid-table, so the send
+    layer can still render it as a Rich Message."""
+
     def test_table_not_split_mid_table(self):
-        """A pipe table that fits a chunk stays whole across a forced split."""
         pre = "x" * 40
         table = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
         text = f"{pre}\n{table}"
         chunks = split_message(text, max_length=50)
-        # The whole table must appear intact inside exactly one chunk.
         assert any(table in c for c in chunks)
 
     def test_table_moves_to_new_chunk_when_it_would_overflow(self):
-        """When the table doesn't fit with preceding text, it starts fresh."""
         pre = "y" * 45
         table = "| a | b |\n| --- | --- |\n| 1 | 2 |"
         chunks = split_message(f"{pre}\n{table}", max_length=50)
@@ -142,12 +195,11 @@ class TestTableAtomicity:
         assert chunks[1] == table
 
     def test_oversized_table_degrades_to_line_split(self):
-        """A single table larger than a chunk falls back to per-line splitting."""
         rows = "\n".join(f"| {'z' * 40} | {i} |" for i in range(10))
         table = f"| h1 | h2 |\n| --- | --- |\n{rows}"
         chunks = split_message(table, max_length=60)
         assert len(chunks) > 1
-        assert all(len(c) <= 60 for c in chunks)
+        assert all(utf16_len(c) <= 60 for c in chunks)
 
     def test_table_and_following_text_separate(self):
         table = "| a | b |\n| --- | --- |\n| 1 | 2 |"
