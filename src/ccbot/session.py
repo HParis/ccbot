@@ -456,6 +456,41 @@ class SessionManager:
             len(stale_keys),
         )
 
+    async def override_session_map_entry(
+        self, window_id: str, session_id: str, cwd: str = "", window_name: str = ""
+    ) -> None:
+        """Force a window's session_map entry to a specific session_id.
+
+        Used after `--resume`: session_map drives both the monitor's watch
+        list and load_session_map()'s sync into window_states, so overriding
+        window_state alone would be reverted on the next poll cycle. Creates
+        the entry if missing (hook timed out); no-op if already consistent.
+        """
+        key = f"{_SESSION_MAP_PREFIX}{window_id}"
+        session_map: dict = {}
+        if config.session_map_file.exists():
+            try:
+                async with aiofiles.open(config.session_map_file, "r") as f:
+                    content = await f.read()
+                session_map = json.loads(content)
+            except (json.JSONDecodeError, OSError):
+                session_map = {}
+
+        info = session_map.get(key)
+        if info is not None and info.get("session_id") == session_id:
+            return  # already consistent
+        if info is None:
+            session_map[key] = {
+                "session_id": session_id,
+                "cwd": cwd,
+                "window_name": window_name,
+            }
+        else:
+            info["session_id"] = session_id
+
+        atomic_write_json(config.session_map_file, session_map)
+        logger.info("session_map override: %s -> session_id=%s", key, session_id)
+
     # --- Display name management ---
 
     def get_display_name(self, window_id: str) -> str:
