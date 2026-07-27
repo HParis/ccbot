@@ -32,6 +32,7 @@ from telegram.error import RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..rich_message import markdown_to_rich_blocks
+from ..telegram_sender import TELEGRAM_MAX_MESSAGE_LENGTH, split_message, utf16_len
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,26 @@ PARSE_MODE = "MarkdownV2"
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
+def plain_chunks(text: str) -> list[str]:
+    """Sentinel-free chunks that each fit Telegram's length limit.
+
+    The plain-text fallback is the last line of defence — it runs when
+    the MarkdownV2 send already failed — so it is exactly where an
+    oversized payload must not be handed to Telegram verbatim.  Content
+    carrying an expandable quote (tool_result, thinking) reaches the send
+    layer deliberately unsplit so the quote stays atomic; convert_markdown
+    truncates the quote to fit, but stripping the sentinels for the plain
+    fallback restores the full length.  Without splitting here, Telegram
+    answers "Message is too long" and the message is dropped outright.
+    """
+    return split_message(strip_sentinels(text))
+
+
+def _fits_formatted(text: str) -> bool:
+    """Whether the MarkdownV2 rendering is within Telegram's limit."""
+    return utf16_len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH
+
+
 async def send_with_fallback(
     bot: Bot,
     chat_id: int,
@@ -79,29 +100,34 @@ async def send_with_fallback(
 ) -> Message | None:
     """Send message with MarkdownV2, falling back to plain text on failure.
 
-    Returns the sent Message on success, None on failure.
+    Oversized content is split across several messages rather than
+    dropped. Returns the last sent Message on success, None on failure.
     RetryAfter is re-raised for caller handling.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    try:
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=_ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
+    formatted = _ensure_formatted(text)
+    if _fits_formatted(formatted):
         try:
             return await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
+                chat_id=chat_id,
+                text=formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
             )
         except RetryAfter:
             raise
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
-            return None
+        except Exception:
+            pass
+    try:
+        sent: Message | None = None
+        for chunk in plain_chunks(text):
+            sent = await bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
+        return sent
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send message to {chat_id}: {e}")
+        return None
 
 
 async def send_rich_message(
@@ -299,42 +325,57 @@ async def send_photo(
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
     """Reply with formatting, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    try:
-        return await message.reply_text(
-            _ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
+    formatted = _ensure_formatted(text)
+    if _fits_formatted(formatted):
         try:
-            return await message.reply_text(strip_sentinels(text), **kwargs)
+            return await message.reply_text(
+                formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
+            )
         except RetryAfter:
             raise
-        except Exception as e:
-            logger.error(f"Failed to reply: {e}")
-            raise
+        except Exception:
+            pass
+    try:
+        chunks = plain_chunks(text)
+        # The first chunk is the reply the caller gets back; the rest
+        # follow it in the topic.
+        sent = await message.reply_text(chunks[0], **kwargs)
+        for chunk in chunks[1:]:
+            await message.reply_text(chunk, **kwargs)
+        return sent
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to reply: {e}")
+        raise
 
 
 async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
     """Edit message with formatting, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    try:
-        await target.edit_message_text(
-            _ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
+    formatted = _ensure_formatted(text)
+    if _fits_formatted(formatted):
         try:
-            await target.edit_message_text(strip_sentinels(text), **kwargs)
+            await target.edit_message_text(
+                formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
+            )
+            return
         except RetryAfter:
             raise
-        except Exception as e:
-            logger.error("Failed to edit message: %s", e)
+        except Exception:
+            pass
+    try:
+        # An edit targets one existing message, so it can't be split —
+        # keep the first chunk rather than losing the edit entirely.
+        await target.edit_message_text(plain_chunks(text)[0], **kwargs)
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error("Failed to edit message: %s", e)
 
 
 async def safe_send(
@@ -348,21 +389,24 @@ async def safe_send(
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=_ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
+    formatted = _ensure_formatted(text)
+    if _fits_formatted(formatted):
         try:
             await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
+                chat_id=chat_id,
+                text=formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
             )
+            return
         except RetryAfter:
             raise
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+        except Exception:
+            pass
+    try:
+        for chunk in plain_chunks(text):
+            await bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send message to {chat_id}: {e}")

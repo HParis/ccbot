@@ -392,6 +392,10 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 2. Send content messages, converting status message to first content part
     first_part = True
     last_msg_id: int | None = None
+    # Send-layer trace.  Without it a message that is enqueued but never
+    # reaches the topic leaves no evidence at all — enqueue is logged, the
+    # send is not, and every failure path below is a silent fallback.
+    sent_ids: list[int | None] = []
     for part in task.parts:
         sent = None
 
@@ -422,6 +426,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 )
                 if converted_msg_id is not None:
                     last_msg_id = converted_msg_id
+                    sent_ids.append(converted_msg_id)
                     continue
 
         if use_rich:
@@ -439,8 +444,19 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
             )
 
+        sent_ids.append(sent.message_id if sent else None)
         if sent:
             last_msg_id = sent.message_id
+
+    logger.debug(
+        "Sent content: user=%d thread=%s window=%s type=%s parts=%s msg_ids=%s",
+        user_id,
+        task.thread_id,
+        wid,
+        task.content_type,
+        [len(p) for p in task.parts],
+        sent_ids,
+    )
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
