@@ -4,15 +4,34 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LAUNCHD_LABEL="com.user.ccbot"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+LAUNCHD_DOMAIN="gui/$(id -u)"
+LAUNCHD_TARGET="${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}"
 MAX_WAIT=10  # seconds to wait for process to exit
+
+# Current PID of the launchd-managed job, or empty when not running.
+service_pid() {
+    launchctl list 2>/dev/null \
+        | awk -v label="$LAUNCHD_LABEL" '$3 == label && $1 ~ /^[0-9]+$/ { print $1 }'
+}
+
+OLD_PID="$(service_pid)"
 
 # --- Stop ALL running ccbot instances ---
 
-# 1. Stop launchd-managed instance (if any)
-if launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL"; then
+# 1. Stop launchd-managed instance (if any).
+# `bootout` (not the legacy `unload`) is what actually removes the job from
+# the gui domain. With the job still bootstrapped, KeepAlive respawns the
+# process the moment we kill it below, and the later `load` then fails with
+# a bogus "Input/output error" even though the bot is running fine.
+if launchctl print "$LAUNCHD_TARGET" >/dev/null 2>&1; then
     echo "Stopping launchd-managed ccbot..."
-    launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
-    sleep 1
+    launchctl bootout "$LAUNCHD_TARGET" 2>/dev/null \
+        || launchctl unload "$LAUNCHD_PLIST" 2>/dev/null \
+        || true
+    for _ in $(seq "$MAX_WAIT"); do
+        launchctl print "$LAUNCHD_TARGET" >/dev/null 2>&1 || break
+        sleep 1
+    done
 fi
 
 # 2. Kill any orphaned ccbot processes
@@ -50,12 +69,29 @@ sleep 1
 # Start ccbot via launchd
 if [ -f "$LAUNCHD_PLIST" ]; then
     echo "Starting ccbot via launchd..."
-    launchctl load "$LAUNCHD_PLIST"
-    sleep 3
-    if launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL"; then
-        echo "ccbot started via launchd (PID: $(launchctl list | grep "$LAUNCHD_LABEL" | awk '{print $1}'))"
+    # Bootstrap if the job is gone; if something re-bootstrapped it in the
+    # meantime (KeepAlive races), kickstart -k restarts it in place. Either
+    # way the check below is what decides success — a failed bootstrap on an
+    # already-running job is not an error.
+    launchctl bootstrap "$LAUNCHD_DOMAIN" "$LAUNCHD_PLIST" 2>/dev/null \
+        || launchctl kickstart -k "$LAUNCHD_TARGET" 2>/dev/null \
+        || true
+
+    # Success = a live PID that isn't the one we started with.
+    NEW_PID=""
+    for _ in $(seq "$MAX_WAIT"); do
+        NEW_PID="$(service_pid)"
+        if [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ]; then
+        echo "ccbot started via launchd (PID: $NEW_PID)"
     else
-        echo "Warning: launchd failed to start ccbot"
+        echo "Error: launchd did not start ccbot (PID: ${NEW_PID:-none})"
+        echo "Diagnose with: launchctl print $LAUNCHD_TARGET"
         exit 1
     fi
 else
