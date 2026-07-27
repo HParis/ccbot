@@ -1357,3 +1357,107 @@ async def test_get_target_window_prefers_existing_ccbot_window(tmp_path: Any) ->
     mgr = _fresh_manager()
     target = await mgr._get_target_window(app)
     assert target is ccbot_window
+
+
+async def test_reconnect_listener_can_reenter_get_connection(
+    monkeypatch: Any,
+) -> None:
+    """A reconnect listener that calls back into _get_connection/_get_app
+    must not deadlock.
+
+    Regression: reconnect listeners were fired while _get_connection still
+    held _connect_lock.  Listeners re-enter _get_connection via _get_app
+    (list_windows → resolve_stale_ids → rebind), and asyncio.Lock is not
+    reentrant, so the whole event loop froze on every iTerm2 restart.
+    """
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+
+    mgr = _fresh_manager()
+    # Pretend we've connected before, so the next connect is a *re*-connect
+    # and reconnect listeners fire.
+    mgr._ever_connected = True
+
+    reentrant_conn: dict[str, Any] = {}
+
+    async def listener() -> None:
+        # Re-enter the connection path exactly like resolve_stale_ids does.
+        reentrant_conn["conn"] = await mgr._get_connection()
+
+    mgr.add_reconnect_listener(listener)
+
+    real_conn = MagicMock(spec=[])
+    with patch("iterm2.Connection.async_create", AsyncMock(return_value=real_conn)):
+        # Guard against the deadlock hanging the suite.
+        conn = await asyncio.wait_for(mgr._get_connection(), timeout=3)
+
+    assert conn is real_conn
+    # The listener ran and its re-entrant call returned the cached connection.
+    assert reentrant_conn.get("conn") is real_conn
+
+
+# ----------------------------------------------------------------------
+# Hung-RPC guard
+# ----------------------------------------------------------------------
+
+
+async def test_public_call_gives_up_on_hung_rpc(monkeypatch: Any) -> None:
+    """A never-answering iTerm2 RPC must not hang a public call forever.
+
+    iTerm2's Python API awaits a bare Future per RPC
+    (connection.async_dispatch_until_id).  When the websocket dies
+    mid-request its read loop exits without resolving *or* cancelling
+    that Future, so an unguarded await blocks for good — which is how a
+    single iTerm2 quit silently froze the status poll loop for days.
+    """
+    monkeypatch.setattr("ccbot.iterm2_manager._CALL_TIMEOUT", 0.05)
+
+    mgr = _fresh_manager()
+    mgr._connection = MagicMock(spec=[])
+    mgr._app = MagicMock(spec=[])
+
+    async def never_answers(*_a: Any, **_kw: Any) -> Any:
+        await asyncio.Future()  # never resolved, never cancelled by iTerm2
+
+    monkeypatch.setattr(mgr, "_resolve_session", never_answers)
+
+    result = await asyncio.wait_for(mgr.capture_pane("UUID-A"), timeout=3)
+
+    assert result is None
+    # The connection is dropped so the next call reconnects instead of
+    # queueing behind the same dead websocket...
+    assert mgr._connection is None
+    assert mgr._app is None
+    # ...and the breaker is open so polling loops back off meanwhile.
+    assert not mgr.is_reachable()
+
+
+async def test_hung_rpc_falls_back_per_method(monkeypatch: Any) -> None:
+    """Each guarded method degrades to its own "unavailable" value."""
+    monkeypatch.setattr("ccbot.iterm2_manager._CALL_TIMEOUT", 0.05)
+
+    async def never_answers(*_a: Any, **_kw: Any) -> Any:
+        await asyncio.Future()
+
+    mgr = _fresh_manager()
+    monkeypatch.setattr(mgr, "_get_app", never_answers)
+    assert await asyncio.wait_for(mgr.list_windows(), timeout=3) == []
+
+    mgr = _fresh_manager()
+    monkeypatch.setattr(mgr, "_get_app", never_answers)
+    assert await asyncio.wait_for(mgr.list_all_sessions(), timeout=3) == []
+
+    mgr = _fresh_manager()
+    monkeypatch.setattr(mgr, "_resolve_session", never_answers)
+    assert await asyncio.wait_for(mgr.send_keys("UUID-A", "hi"), timeout=3) is False
+
+    mgr = _fresh_manager()
+    monkeypatch.setattr(mgr, "_resolve_session", never_answers)
+    assert await asyncio.wait_for(mgr.kill_window("UUID-A"), timeout=3) is False
+
+    mgr = _fresh_manager()
+    monkeypatch.setattr(mgr, "_get_app", never_answers)
+    ok, msg, _name, _uuid = await asyncio.wait_for(
+        mgr.create_window("/tmp", start_claude=False), timeout=3
+    )
+    assert ok is False
+    assert "timed out" in msg

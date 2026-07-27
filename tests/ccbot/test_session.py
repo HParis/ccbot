@@ -489,11 +489,27 @@ class TestClaimRunningClaude:
 class TestReconnectListener:
     """iterm2_manager fires reconnect listeners only on *re*-connects,
     not on the first-ever connection (startup already runs the same
-    re-resolution path)."""
+    re-resolution path).  Listeners fire AFTER _connect_lock is released
+    so they can safely re-enter _get_connection without self-deadlocking."""
 
-    async def test_listener_skipped_on_first_connection(self) -> None:
+    @staticmethod
+    async def _connect(mgr) -> None:
+        """Drive one successful _get_connection, dropping the cached
+        connection first so each call re-runs the connect path (a real
+        iTerm2 restart invalidates the cache the same way)."""
+        from unittest.mock import AsyncMock, patch
+
+        mgr._connection = None
+        with patch(
+            "iterm2.Connection.async_create",
+            AsyncMock(return_value=object()),
+        ):
+            await mgr._get_connection()
+
+    async def test_listener_skipped_on_first_connection(self, monkeypatch) -> None:
         from ccbot.iterm2_manager import ITerm2Manager
 
+        monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0,))
         mgr = ITerm2Manager()
         called = 0
 
@@ -502,13 +518,14 @@ class TestReconnectListener:
             called += 1
 
         mgr.add_reconnect_listener(listener)
-        await mgr._handle_fresh_connection()
+        await self._connect(mgr)  # first-ever connect
         assert called == 0
         assert mgr._ever_connected is True
 
-    async def test_listener_fires_on_subsequent_connections(self) -> None:
+    async def test_listener_fires_on_subsequent_connections(self, monkeypatch) -> None:
         from ccbot.iterm2_manager import ITerm2Manager
 
+        monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0,))
         mgr = ITerm2Manager()
         calls: list[int] = []
 
@@ -516,14 +533,15 @@ class TestReconnectListener:
             calls.append(1)
 
         mgr.add_reconnect_listener(listener)
-        await mgr._handle_fresh_connection()  # first connect
-        await mgr._handle_fresh_connection()  # reconnect
-        await mgr._handle_fresh_connection()  # reconnect
+        await self._connect(mgr)  # first connect — no fire
+        await self._connect(mgr)  # reconnect — fire
+        await self._connect(mgr)  # reconnect — fire
         assert calls == [1, 1]
 
-    async def test_listener_exception_does_not_break_others(self) -> None:
+    async def test_listener_exception_does_not_break_others(self, monkeypatch) -> None:
         from ccbot.iterm2_manager import ITerm2Manager
 
+        monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0,))
         mgr = ITerm2Manager()
         ran: list[str] = []
 
@@ -536,8 +554,8 @@ class TestReconnectListener:
 
         mgr.add_reconnect_listener(bad)
         mgr.add_reconnect_listener(good)
-        await mgr._handle_fresh_connection()  # first; nothing fires
-        await mgr._handle_fresh_connection()  # reconnect; both fire
+        await self._connect(mgr)  # first; nothing fires
+        await self._connect(mgr)  # reconnect; both fire
         assert ran == ["bad", "good"]
 
 

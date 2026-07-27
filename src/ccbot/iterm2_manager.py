@@ -21,11 +21,14 @@ Key class: ITerm2Manager (singleton instantiated as ``iterm2_manager``).
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 import tempfile
 from asyncio import sleep as _sleep
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any, TypeVar, cast
 
 import iterm2
 import iterm2.screen as iterm2_screen
@@ -58,6 +61,20 @@ _RECONNECT_DELAYS: tuple[float, ...] = (0.0, 1.0, 2.0, 4.0)
 # iTerm2 needs a moment to start the WebSocket server; first attempt
 # is delayed 1.5s to give it a head start.
 _LAUNCH_DELAYS: tuple[float, ...] = (1.5, 2.0, 3.0, 5.0)
+
+# Hard ceiling on any single public backend call.  iTerm2's Python API
+# awaits a bare Future for each RPC response
+# (``connection.async_dispatch_until_id``); its read loop
+# (``_async_dispatch_forever``) is the only thing that ever resolves it.
+# When the websocket dies mid-request that read loop exits on the socket
+# error WITHOUT resolving or cancelling the pending Future, so an
+# unguarded ``await`` blocks forever — a single iTerm2 quit is enough to
+# freeze a caller permanently.  That is what silently killed the status
+# poll loop (and with it the per-second topic auto-rebind) for days.
+#
+# Sized above the worst legitimate path: connect backoff (0+1+2+4 = 7s)
+# plus auto-launch plus post-launch backoff (1.5+2+3+5 = 11.5s).
+_CALL_TIMEOUT = 45.0
 
 # Marker variable used to identify ccbot-owned sessions. Stored as the
 # iTerm2 user-variable ``user.ccbot``; value is the literal "1".
@@ -98,6 +115,44 @@ _BASH_PREFIX_DELAY = 1.0
 # sites and tests import ``ITermWindow``; new code should prefer
 # ``TerminalSession``. ``window_id`` carries the iTerm2 session UUID.
 ITermWindow = TerminalSession
+
+
+_AsyncMethod = TypeVar("_AsyncMethod", bound=Callable[..., Awaitable[Any]])
+
+# Sentinel: re-raise as ConnectionError instead of returning a value.
+_RAISE = object()
+
+
+def _bounded(fallback: Any = _RAISE) -> Callable[[_AsyncMethod], _AsyncMethod]:
+    """Cap a public backend call at ``_CALL_TIMEOUT`` seconds.
+
+    Guarantees no caller can wedge on a half-dead iTerm2 websocket (see
+    ``_CALL_TIMEOUT``).  On timeout the connection is abandoned and the
+    circuit breaker trips, so polling loops back off instead of queueing
+    behind the same dead socket.
+
+    ``fallback`` is the method's own "iTerm2 is unavailable" value — the
+    same one it already returns when ``_get_app`` raises ConnectionError.
+    The default re-raises the timeout as ConnectionError.
+    """
+
+    def decorate(fn: _AsyncMethod) -> _AsyncMethod:
+        @functools.wraps(fn)
+        async def wrapper(self: ITerm2Manager, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return await asyncio.wait_for(fn(self, *args, **kwargs), _CALL_TIMEOUT)
+            except TimeoutError:
+                await self._abandon_connection(fn.__name__)
+                if fallback is _RAISE:
+                    raise ConnectionError(
+                        f"iTerm2 call {fn.__name__} timed out "
+                        f"after {_CALL_TIMEOUT:.0f}s"
+                    ) from None
+                return fallback
+
+        return cast(_AsyncMethod, wrapper)
+
+    return decorate
 
 
 class ITerm2Manager:
@@ -161,19 +216,6 @@ class ITerm2Manager:
                 await cb()
             except Exception as e:
                 logger.error("iTerm2 reconnect listener failed: %s", e)
-
-    async def _handle_fresh_connection(self) -> None:
-        """Run post-connect bookkeeping after _get_connection succeeds.
-
-        First-ever connect just flips the flag; later connects fire the
-        reconnect listeners so callers can re-resolve stale session UUIDs
-        (iTerm2 assigns new UUIDs to every tab after a restart, breaking
-        every cached binding).
-        """
-        if not self._ever_connected:
-            self._ever_connected = True
-            return
-        await self._fire_reconnect_listeners()
 
     async def _try_connect_once(
         self,
@@ -285,43 +327,52 @@ class ITerm2Manager:
             # backoff (1s / 2s / 4s) — fast path for the common case.
             conn, err = await self._try_connect_with_backoff(_RECONNECT_DELAYS)
             if conn is not None:
-                self._connection = conn
-                self._app = None
                 logger.info("Connected to iTerm2 Python API")
-                await self._handle_fresh_connection()
-                return conn
+            else:
+                # Phase 2: probably not running — try to launch it.
+                logger.info(
+                    "iTerm2 unreachable after %d attempts; launching via "
+                    "'open -a iTerm'",
+                    len(_RECONNECT_DELAYS),
+                )
+                launched = await self._launch_iterm2()
+                if not launched:
+                    self._trip_breaker()
+                    raise ConnectionError(
+                        "Cannot reach iTerm2 and could not launch it via "
+                        "'open -a iTerm'.  Make sure iTerm2 is installed and "
+                        "the Python API is enabled (Preferences → General → "
+                        "Magic → Enable Python API)."
+                    ) from err
 
-            # Phase 2: probably not running — try to launch it.
-            logger.info(
-                "iTerm2 unreachable after %d attempts; launching via 'open -a iTerm'",
-                len(_RECONNECT_DELAYS),
-            )
-            launched = await self._launch_iterm2()
-            if not launched:
-                self._trip_breaker()
-                raise ConnectionError(
-                    "Cannot reach iTerm2 and could not launch it via "
-                    "'open -a iTerm'.  Make sure iTerm2 is installed and "
-                    "the Python API is enabled (Preferences → General → "
-                    "Magic → Enable Python API)."
-                ) from err
-
-            # Phase 3: iTerm2 takes a moment to start serving the API
-            # after launch.  Slightly longer waits than phase 1.
-            conn, err = await self._try_connect_with_backoff(_LAUNCH_DELAYS)
-            if conn is not None:
-                self._connection = conn
-                self._app = None
+                # Phase 3: iTerm2 takes a moment to start serving the API
+                # after launch.  Slightly longer waits than phase 1.
+                conn, err = await self._try_connect_with_backoff(_LAUNCH_DELAYS)
+                if conn is None:
+                    self._trip_breaker()
+                    raise ConnectionError(
+                        "iTerm2 launched but the Python API is still "
+                        "unreachable. Verify Preferences → General → Magic → "
+                        "Enable Python API is on, then retry."
+                    ) from err
                 logger.info("Connected to iTerm2 Python API after auto-launch")
-                await self._handle_fresh_connection()
-                return conn
 
-            self._trip_breaker()
-            raise ConnectionError(
-                "iTerm2 launched but the Python API is still unreachable. "
-                "Verify Preferences → General → Magic → Enable Python API "
-                "is on, then retry."
-            ) from err
+            self._connection = conn
+            self._app = None
+            # Decide whether this is a *re*-connection INSIDE the lock, but
+            # defer firing reconnect listeners until AFTER the lock is
+            # released.  Listeners re-enter _get_connection()/_get_app()
+            # (list_windows → resolve_stale_ids → rebind) and asyncio.Lock
+            # is NOT reentrant — firing them while still holding the lock
+            # self-deadlocks the whole event loop on every iTerm2 restart.
+            # self._connection is already set above, so the re-entrant call
+            # hits the cached-connection fast path and returns immediately.
+            fire_reconnect = self._ever_connected
+            self._ever_connected = True
+
+        if fire_reconnect:
+            await self._fire_reconnect_listeners()
+        return conn
 
     async def _close_connection(self, conn: iterm2.Connection | None) -> None:
         """Close an iTerm2 Connection's underlying websocket, cancel
@@ -489,6 +540,29 @@ class ITerm2Manager:
         self._connection = None
         self._app = None
 
+    async def _abandon_connection(self, label: str) -> None:
+        """Tear down a connection whose RPC never came back.
+
+        Called by ``_bounded`` on timeout: the websocket is (at best)
+        half-dead, so drop and close it, and trip the breaker so the
+        1s/2s polling loops back off rather than piling more doomed
+        calls onto it.
+        """
+        logger.warning(
+            "iTerm2 call %s timed out after %.0fs; dropping the connection",
+            label,
+            _CALL_TIMEOUT,
+        )
+        stale = self._connection
+        self._invalidate_connection()
+        self._trip_breaker()
+        if stale is None:
+            return
+        try:
+            await asyncio.wait_for(self._close_connection(stale), timeout=5.0)
+        except Exception as e:
+            logger.debug("Failed to close timed-out iTerm2 connection: %s", e)
+
     # ------------------------------------------------------------------
     # TerminalBackend contract: capabilities + neutral lifecycle
     # ------------------------------------------------------------------
@@ -511,6 +585,7 @@ class ITerm2Manager:
         """An iTerm2 session id is a UUID."""
         return bool(_UUID_RE.match(candidate))
 
+    @_bounded()
     async def preflight(self) -> None:
         """Verify iTerm2 is reachable, raising ConnectionError if not.
 
@@ -524,6 +599,7 @@ class ITerm2Manager:
         """Drop the cached connection so the next call reconnects fresh."""
         self._invalidate_connection()
 
+    @_bounded(fallback=False)
     async def ensure_running(self) -> bool:
         """Ensure iTerm2 is up (``_get_app`` auto-launches it); report reach."""
         try:
@@ -536,6 +612,7 @@ class ITerm2Manager:
     # Read-only discovery
     # ------------------------------------------------------------------
 
+    @_bounded(fallback=[])
     async def list_windows(self) -> list[ITermWindow]:
         """List ccbot-owned tabs (sessions tagged with ``user.ccbot=1``).
 
@@ -558,6 +635,7 @@ class ITerm2Manager:
                         results.append(info)
         return results
 
+    @_bounded(fallback=None)
     async def find_window_by_name(self, window_name: str) -> ITermWindow | None:
         """Find a ccbot-owned session by its display name."""
         for w in await self.list_windows():
@@ -566,6 +644,7 @@ class ITerm2Manager:
         logger.debug("Window not found by name: %s", window_name)
         return None
 
+    @_bounded(fallback=[])
     async def list_all_sessions(
         self, claude_session_uuids: set[str] | None = None
     ) -> list[ITermWindow]:
@@ -621,6 +700,7 @@ class ITerm2Manager:
             has_claude=session.session_id in known,
         )
 
+    @_bounded(fallback=False)
     async def bind_existing_session(self, window_id: str, name: str) -> bool:
         """Adopt an existing iTerm2 session into ccbot's pool.
 
@@ -652,6 +732,7 @@ class ITerm2Manager:
         logger.info("Bound existing iTerm2 session %s as '%s'", window_id, name)
         return True
 
+    @_bounded(fallback=None)
     async def find_window_by_id(self, window_id: str) -> ITermWindow | None:
         """Find a ccbot-owned session by its iTerm2 session UUID."""
         try:
@@ -718,6 +799,7 @@ class ITerm2Manager:
             return None
         return app.get_session_by_id(window_id)
 
+    @_bounded(fallback=None)
     async def screenshot_session(self, window_id: str) -> bytes | None:
         """Capture a real pixel screenshot of the ccbot session's tab.
 
@@ -841,6 +923,7 @@ class ITerm2Manager:
             logger.error("osascript returned non-numeric window id: %r", out)
             return None
 
+    @_bounded(fallback=None)
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a session's screen.
 
@@ -874,6 +957,7 @@ class ITerm2Manager:
                 lines.append(line.string)
         return "\n".join(lines)
 
+    @_bounded(fallback=False)
     async def send_keys(
         self,
         window_id: str,
@@ -937,6 +1021,7 @@ class ITerm2Manager:
     # Window lifecycle
     # ------------------------------------------------------------------
 
+    @_bounded(fallback=False)
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a ccbot-owned session."""
         session = await self._resolve_session(window_id)
@@ -951,6 +1036,7 @@ class ITerm2Manager:
             logger.error("Failed to rename session %s: %s", window_id, e)
             return False
 
+    @_bounded(fallback=False)
     async def kill_window(self, window_id: str) -> bool:
         """Close a ccbot-owned session.
 
@@ -1012,6 +1098,7 @@ class ITerm2Manager:
             logger.error("Failed to create tab with default profile: %s", e)
             return None
 
+    @_bounded(fallback=(False, "iTerm2 call timed out", "", ""))
     async def create_window(
         self,
         work_dir: str,
