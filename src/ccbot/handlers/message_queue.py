@@ -78,14 +78,25 @@ _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
 # for editing tool_use messages with results
 _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
-# Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
-_status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+# Status message tracking:
+#   (user_id, thread_id_or_0) -> (message_id, window_id, last_text, posted_at)
+# posted_at is a monotonic timestamp — see STATUS_REUSE_MAX_AGE.
+_status_msg_info: dict[tuple[int, int], tuple[int, str, str, float]] = {}
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
+
+# How long a status message may still be edited into the first content
+# message. The conversion assumes the status message is the topic's last
+# message; the moment anything lands after it (the user typing, a status
+# clear that got dropped, a whole night passing) editing it buries the
+# reply up the history where the user never looks — indistinguishable
+# from the bot not answering at all. Normal conversions happen within
+# seconds, so a short window costs nothing.
+STATUS_REUSE_MAX_AGE = 90.0
 
 
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
@@ -200,6 +211,17 @@ async def _merge_content_tasks(
     )
 
 
+def _droppable_during_flood(task: MessageTask) -> bool:
+    """Whether a task may be skipped while a flood-control ban is active.
+
+    Only a status *update* is ephemeral. Content is real Claude output, and
+    a status *clear* retires the tracked status message — dropping it leaves
+    tracking that points at a message which is no longer the topic's last,
+    so the next reply gets edited into it and buried up the history.
+    """
+    return task.task_type == "status_update"
+
+
 async def _process_content_with_retry(
     bot: Bot, user_id: int, task: MessageTask, max_attempts: int = 3
 ) -> None:
@@ -257,8 +279,7 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                 if flood_end > 0:
                     remaining = flood_end - time.monotonic()
                     if remaining > 0:
-                        if task.task_type != "content":
-                            # Status is ephemeral — safe to drop
+                        if _droppable_during_flood(task):
                             continue
                         # Content is actual Claude output — wait then send
                         logger.debug(
@@ -485,10 +506,19 @@ async def _convert_status_to_content(
     if not info:
         return None
 
-    msg_id, stored_wid, _ = info
+    msg_id, stored_wid, _, posted_at = info
     chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
-    if stored_wid != window_id:
-        # Different window, just delete the old status
+    stale = time.monotonic() - posted_at > STATUS_REUSE_MAX_AGE
+    if stored_wid != window_id or stale:
+        # Wrong window, or too old to still be the topic's last message —
+        # editing it would file the reply above everything posted since.
+        # Drop it and let the caller send the content fresh.
+        if stale:
+            logger.debug(
+                "Status message %d too old to reuse (%.0fs); sending fresh content",
+                msg_id,
+                time.monotonic() - posted_at,
+            )
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception:
@@ -544,7 +574,7 @@ async def _process_status_update_task(
     current_info = _status_msg_info.get(skey)
 
     if current_info:
-        msg_id, stored_wid, last_text = current_info
+        msg_id, stored_wid, last_text, posted_at = current_info
 
         if stored_wid != wid:
             # Window changed - delete old and send new
@@ -573,7 +603,7 @@ async def _process_status_update_task(
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )
-                _status_msg_info[skey] = (msg_id, wid, status_text)
+                _status_msg_info[skey] = (msg_id, wid, status_text, posted_at)
             except RetryAfter:
                 raise
             except Exception:
@@ -584,7 +614,7 @@ async def _process_status_update_task(
                         text=status_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
-                    _status_msg_info[skey] = (msg_id, wid, status_text)
+                    _status_msg_info[skey] = (msg_id, wid, status_text, posted_at)
                 except RetryAfter:
                     raise
                 except Exception as e:
@@ -630,7 +660,12 @@ async def _do_send_status_message(
         **_send_kwargs(thread_id),  # type: ignore[arg-type]
     )
     if sent:
-        _status_msg_info[skey] = (sent.message_id, window_id, text)
+        _status_msg_info[skey] = (
+            sent.message_id,
+            window_id,
+            text,
+            time.monotonic(),
+        )
 
 
 async def _do_clear_status_message(
@@ -715,10 +750,16 @@ async def enqueue_status_update(
     status_text: str | None,
     thread_id: int | None = None,
 ) -> None:
-    """Enqueue status update. Skipped if text unchanged or during flood control."""
-    # Don't enqueue during flood control — they'd just be dropped
+    """Enqueue status update. Skipped if text unchanged or during flood control.
+
+    A *clear* (status_text=None) is enqueued even mid-ban: it retires the
+    tracked status message, and leaving that tracking stale makes the next
+    content message edit a message that is no longer the topic's last one.
+    """
+    # Don't enqueue cosmetic updates during flood control — they'd just be
+    # dropped on the way out anyway.
     flood_end = _flood_until.get(user_id, 0)
-    if flood_end > time.monotonic():
+    if status_text and flood_end > time.monotonic():
         return
 
     tid = thread_id or 0
