@@ -51,7 +51,6 @@ from telegram import (
 from telegram.constants import ChatAction
 from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -137,6 +136,7 @@ from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
+from . import telemetry
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .terminal.manager import terminal_manager
 from .transcribe import close_client as close_transcribe_client
@@ -153,6 +153,9 @@ _status_poll_task: asyncio.Task | None = None
 
 # Polling watchdog task
 _polling_watchdog_task: asyncio.Task | None = None
+
+# API call accounting task
+_telemetry_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded as keystrokes)
 CC_COMMANDS: dict[str, str] = {
@@ -2051,6 +2054,11 @@ async def post_init(application: Application) -> None:
     _polling_watchdog_task = asyncio.create_task(_watch_polling_task(application))
     logger.info("Polling watchdog started")
 
+    # Start outbound API call accounting — every topic in the group shares one
+    # 20-calls-per-minute budget, and most of what spends it is otherwise unlogged.
+    global _telemetry_task
+    _telemetry_task = asyncio.create_task(telemetry.summary_loop())
+
 
 async def _restart_polling(updater: Any) -> bool:
     """Stop polling, reset the httpx connection pool, and restart.
@@ -2204,7 +2212,16 @@ async def _watch_polling_task(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task, _polling_watchdog_task
+    global _status_poll_task, _polling_watchdog_task, _telemetry_task
+
+    if _telemetry_task:
+        _telemetry_task.cancel()
+        try:
+            await _telemetry_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _telemetry_task = None
+        logger.info("Final %s", telemetry.format_summary())
 
     # Stop polling watchdog
     if _polling_watchdog_task:
@@ -2247,7 +2264,7 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        .rate_limiter(telemetry.CountingRateLimiter(max_retries=5))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .request(

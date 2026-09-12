@@ -560,3 +560,38 @@ class TestFormatWriteLineCount:
             "File created successfully at: /tmp/x.py", "Write", None
         )
         assert out == "  ⎿  Wrote 0 lines"
+
+
+class TestEmptyThinkingBlocks:
+    """A thinking block with no text (redacted / signature-only, which is what
+    Claude Code writes for encrypted thinking) used to become the literal
+    message "∴ Thinking…\n(thinking)". It told the user nothing and cost one
+    slot of a hard 20-messages-per-minute group budget; 86 of one day's 129
+    thinking messages were exactly that placeholder.
+    """
+
+    def test_empty_thinking_block_produces_no_entry(self):
+        entry = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "abc"},
+                ]
+            },
+        }
+        parsed, _ = TranscriptParser.parse_entries([entry])
+        assert [p for p in parsed if p.content_type == "thinking"] == []
+
+    def test_thinking_with_text_still_produces_an_entry(self):
+        entry = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "weighing the options"},
+                ]
+            },
+        }
+        parsed, _ = TranscriptParser.parse_entries([entry])
+        thinking = [p for p in parsed if p.content_type == "thinking"]
+        assert len(thinking) == 1
+        assert "weighing the options" in thinking[0].text

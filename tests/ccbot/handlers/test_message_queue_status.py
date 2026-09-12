@@ -96,3 +96,124 @@ def test_status_clear_is_not_droppable_during_flood() -> None:
     assert mq._droppable_during_flood(mq.MessageTask(task_type="status_update"))
     assert not mq._droppable_during_flood(mq.MessageTask(task_type="status_clear"))
     assert not mq._droppable_during_flood(mq.MessageTask(task_type="content"))
+
+
+class TestStatusThrottling:
+    """The status line embeds a live counter — 'Gusting… (1m 45s · ↓ 5.7k
+    tokens)' changes every single second. Exact-text dedup therefore never
+    hit while Claude worked, so each 1-second poll produced one edit: up to
+    60 API calls per minute per active topic against a group budget of 20.
+    Only a change of *state* deserves an immediate edit; the counter gets a
+    slow refresh so the message still visibly ticks.
+    """
+
+    def test_counter_only_change_is_the_same_state(self) -> None:
+        a = mq._status_state_key("Gusting… (1m 45s · ↓ 5.7k tokens)")
+        b = mq._status_state_key("Gusting… (1m 46s · ↓ 5.9k tokens)")
+        assert a == b
+
+    def test_state_change_is_distinct(self) -> None:
+        a = mq._status_state_key("Gusting… (1m 45s · ↓ 5.7k tokens)")
+        b = mq._status_state_key("Crafting… (1m 46s · ↓ 5.7k tokens)")
+        assert a != b
+
+    def test_elapsed_only_line_is_stable(self) -> None:
+        assert mq._status_state_key("Brewed for 8m 8s") == mq._status_state_key(
+            "Brewed for 8m 31s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_counter_tick_is_not_enqueued(self) -> None:
+        bot = MagicMock()
+        mq._status_msg_info[(1, 5)] = (
+            999,
+            "W",
+            "Gusting… (1m 45s · ↓ 5.7k tokens)",
+            time.monotonic(),
+        )
+        mq._status_last_edit[(1, 5)] = time.monotonic()
+        try:
+            await mq.enqueue_status_update(
+                bot, 1, "W", "Gusting… (1m 46s · ↓ 5.7k tokens)", thread_id=5
+            )
+            assert (1, 5) not in mq._message_queues
+        finally:
+            mq._status_last_edit.clear()
+            await mq.shutdown_workers()
+
+    @pytest.mark.asyncio
+    async def test_state_change_is_enqueued_immediately(self) -> None:
+        bot = MagicMock()
+        mq._status_msg_info[(1, 5)] = (
+            999,
+            "W",
+            "Gusting… (1m 45s · ↓ 5.7k tokens)",
+            time.monotonic(),
+        )
+        mq._status_last_edit[(1, 5)] = time.monotonic()
+        try:
+            await mq.enqueue_status_update(
+                bot, 1, "W", "Crafting… (1m 46s · ↓ 5.7k tokens)", thread_id=5
+            )
+            assert mq._message_queues[(1, 5)].qsize() == 1
+        finally:
+            mq._status_last_edit.clear()
+            await mq.shutdown_workers()
+
+    @pytest.mark.asyncio
+    async def test_counter_still_refreshes_slowly(self) -> None:
+        """The seconds must not freeze — a stale-enough tick still goes out
+        so the user can see the session is alive."""
+        bot = MagicMock()
+        mq._status_msg_info[(1, 5)] = (
+            999,
+            "W",
+            "Gusting… (1m 45s · ↓ 5.7k tokens)",
+            time.monotonic(),
+        )
+        mq._status_last_edit[(1, 5)] = time.monotonic() - mq.STATUS_REFRESH_INTERVAL - 1
+        try:
+            await mq.enqueue_status_update(
+                bot, 1, "W", "Gusting… (2m 30s · ↓ 6.1k tokens)", thread_id=5
+            )
+            assert mq._message_queues[(1, 5)].qsize() == 1
+        finally:
+            mq._status_last_edit.clear()
+            await mq.shutdown_workers()
+
+
+class TestToolResultLeavesStatusAlone:
+    """A tool_result is delivered by editing the tool_use message that is
+    already above the status message. Nothing is appended, so the status
+    message does not move — deleting it and posting an identical one back
+    cost two API calls per tool call for no visible change. The 1s status
+    poll keeps it current on its own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tool_result_edit_does_not_churn_the_status_message(self) -> None:
+        bot = _bot()
+        bot.send_message = AsyncMock()
+        mq._status_msg_info[(1, 5)] = (999, "W", "working…", time.monotonic())
+        mq._tool_msg_ids[("tu_1", 1, 5)] = 555
+
+        task = mq.MessageTask(
+            task_type="content",
+            window_id="W",
+            parts=["result body"],
+            tool_use_id="tu_1",
+            content_type="tool_result",
+            thread_id=5,
+        )
+        try:
+            await mq._process_content_task(bot, 1, task)
+        finally:
+            mq._tool_msg_ids.clear()
+
+        # The tool_use message was edited in place...
+        bot.edit_message_text.assert_awaited_once()
+        assert bot.edit_message_text.await_args.kwargs["message_id"] == 555
+        # ...and the status message was left exactly where it was.
+        bot.delete_message.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+        assert mq._status_msg_info[(1, 5)][0] == 999

@@ -39,8 +39,15 @@ logger = logging.getLogger(__name__)
 # Status polling interval
 STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
 
-# Topic existence probe interval
-TOPIC_CHECK_INTERVAL = 60.0  # seconds
+# Topic existence probe interval.
+#
+# One API call per bound topic per pass, purely to notice that a topic was
+# deleted. At 60s with 7 topics that was 7 calls/min — 35% of the group's
+# 20-per-minute budget spent on liveness probing, measured as the largest
+# non-content consumer. Nothing depends on noticing a deletion promptly:
+# the topic is gone either way, and all the cleanup does is kill the tab and
+# unbind the thread.
+TOPIC_CHECK_INTERVAL = 300.0  # seconds
 
 
 async def update_status_message(

@@ -25,7 +25,15 @@ Flood control (`_flood_until`) stays keyed by user: a 429 throttles the whole su
 
 **Polling**: Background task polls terminal status for all active windows at 1-second intervals. Send-layer rate limiting ensures flood control is not triggered.
 
-**Deduplication**: The worker compares `last_text` when processing status updates; identical content skips the edit, reducing API calls.
+**Throttling**: The status line carries a live counter — `Gusting… (1m 45s · ↓ 5.7k tokens)` is a different string every second — so exact-text dedup never hit while Claude worked and every 1s poll became an edit: up to 60 API calls/min per active topic against a 20/min group budget. `enqueue_status_update` now compares `_status_state_key()` (the line with its parenthesised counter and digits stripped): a change of *state* edits immediately, a counter tick waits `STATUS_REFRESH_INTERVAL` (15s) so the seconds still visibly advance. The worker also skips the edit when `last_text` is unchanged.
+
+## API Call Accounting
+
+Every send, edit, delete and chat action spends the same 20-per-minute per-group budget, but only content sends were logged — status edits, tool_result edits and picker renders were invisible, so a topic could go silent with nothing in the log to explain it. `telemetry.py` counts every outbound call: `CountingRateLimiter` (the rate limiter is the one chokepoint every request passes through) records `api:<endpoint>`, and call sites tag semantic kinds (`status:*`, `content:*`, `picker:*`). One summary line per minute lands in the log.
+
+Findings acted on so far:
+- **Topic existence probe** (`TOPIC_CHECK_INTERVAL`) was one call per bound topic per minute — 7/min with 7 topics, 35% of the budget. Raised to 300s; a deleted topic is gone either way, so noticing it later costs nothing.
+- **tool_result edits no longer churn the status message.** That branch edits the tool_use message already sitting above the status, so nothing moves — the old clear-then-repost spent two calls per tool call for no visible change.
 
 ## Rate Limiting
 

@@ -552,7 +552,6 @@ class TranscriptParser:
 
             if msg_type == "assistant":
                 # Process content blocks
-                has_text = False
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -569,7 +568,6 @@ class TranscriptParser:
                                     timestamp=entry_timestamp,
                                 )
                             )
-                            has_text = True
 
                     elif btype == "tool_use":
                         tool_id = block.get("id", "")
@@ -640,15 +638,14 @@ class TranscriptParser:
                                     timestamp=entry_timestamp,
                                 )
                             )
-                        elif not has_text:
-                            result.append(
-                                ParsedEntry(
-                                    role="assistant",
-                                    text="(thinking)",
-                                    content_type="thinking",
-                                    timestamp=entry_timestamp,
-                                )
-                            )
+                        # A thinking block with no text (encrypted /
+                        # signature-only, which is what Claude Code writes
+                        # for redacted thinking) used to emit a literal
+                        # "(thinking)" placeholder. It told the user nothing
+                        # and spent one slot of the group's hard 20-messages
+                        # -per-minute budget — 86 of one day's 129 thinking
+                        # messages were exactly that. Whatever the turn does
+                        # next (text or a tool call) is the real signal.
 
             elif msg_type == "user":
                 # Check for tool_result blocks and merge with pending tools

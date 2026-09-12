@@ -28,6 +28,7 @@ Key components:
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Literal
@@ -36,6 +37,7 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
+from .. import telemetry
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
@@ -112,6 +114,33 @@ FLOOD_CONTROL_MAX_WAIT = 10
 # from the bot not answering at all. Normal conversions happen within
 # seconds, so a short window costs nothing.
 STATUS_REUSE_MAX_AGE = 90.0
+
+# How often a status message may be refreshed when only its counter moved.
+#
+# The status line carries a live counter — "Gusting… (1m 45s · ↓ 5.7k tokens)"
+# is a different string every second — so exact-text dedup never hit while
+# Claude worked and every 1s poll turned into an edit: up to 60 API calls per
+# minute per active topic, against a budget of 20 per minute for the whole
+# group. A change of *state* still edits immediately; a counter tick waits for
+# this interval so the seconds visibly advance without burning the budget.
+STATUS_REFRESH_INTERVAL = 15.0
+
+# (user_id, thread_id_or_0) -> monotonic time of the last status edit
+_status_last_edit: dict[tuple[int, int], float] = {}
+
+# Volatile tail of a status line: the parenthesised "(1m 45s · ↓ 5.7k tokens)".
+_RE_STATUS_COUNTER = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _status_state_key(text: str) -> str:
+    """Reduce a status line to the part that reflects actual state.
+
+    Strips the trailing parenthesised counter and any remaining digits, so
+    "Gusting… (1m 45s · ↓ 5.7k tokens)" and "Gusting… (1m 46s · ↓ 5.9k
+    tokens)" collapse to one key, while "Crafting… (…)" stays distinct.
+    Never displayed — comparison only.
+    """
+    return re.sub(r"\d+", "", _RE_STATUS_COUNTER.sub("", text)).strip()
 
 
 def get_message_queue(
@@ -414,8 +443,13 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         _tkey = (task.tool_use_id, user_id, tid)
         edit_msg_id = _tool_msg_ids.pop(_tkey, None)
         if edit_msg_id is not None:
-            # Clear status message first
-            await _do_clear_status_message(bot, user_id, tid)
+            telemetry.count("content:tool_result_edit")
+            # The status message is *not* touched here. This branch appends
+            # nothing — it edits the tool_use message that already sits above
+            # the status — so the status stays last either way. Deleting it
+            # and posting an identical one back cost two API calls per tool
+            # call out of a 20-per-minute group budget, for no visible
+            # change; the 1s status poll keeps it current on its own.
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
             try:
@@ -427,7 +461,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     link_preview_options=NO_LINK_PREVIEW,
                 )
                 await _send_task_images(bot, chat_id, task)
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
                 raise
@@ -442,7 +475,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         link_preview_options=NO_LINK_PREVIEW,
                     )
                     await _send_task_images(bot, chat_id, task)
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
                     raise
@@ -459,6 +491,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     sent_ids: list[int | None] = []
     for part in task.parts:
         sent = None
+        telemetry.count(f"content:{task.content_type}")
 
         # Rich Messages (tables/headings/lists/math) are send-only — they can't
         # be produced by editing a text status message, and tool_use/tool_result
@@ -625,8 +658,10 @@ async def _process_status_update_task(
             return
         else:
             # Same window, text changed - edit in place
+            telemetry.count("status:edit")
             # Send typing indicator when Claude is working
             if "esc to interrupt" in status_text.lower():
+                telemetry.count("status:typing")
                 try:
                     await bot.send_chat_action(
                         chat_id=chat_id, action=ChatAction.TYPING
@@ -681,12 +716,15 @@ async def _do_send_status_message(
     # This catches edge cases where tracking was cleared without deleting the message.
     old = _status_msg_info.pop(skey, None)
     if old:
+        telemetry.count("status:delete")
         try:
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
         except Exception:
             pass
+    telemetry.count("status:send")
     # Send typing indicator when Claude is working
     if "esc to interrupt" in text.lower():
+        telemetry.count("status:typing")
         try:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except RetryAfter:
@@ -717,6 +755,7 @@ async def _do_clear_status_message(
     skey = (user_id, thread_id_or_0)
     info = _status_msg_info.pop(skey, None)
     if info:
+        telemetry.count("status:delete")
         msg_id = info[0]
         chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
         try:
@@ -804,12 +843,22 @@ async def enqueue_status_update(
 
     tid = thread_id or 0
 
-    # Deduplicate: skip if text matches what's already displayed
+    # Deduplicate: skip a tick that carries no new state.
     if status_text:
         skey = (user_id, tid)
         info = _status_msg_info.get(skey)
-        if info and info[1] == window_id and info[2] == status_text:
-            return
+        if info and info[1] == window_id:
+            same_state = _status_state_key(info[2]) == _status_state_key(status_text)
+            fresh = (
+                time.monotonic() - _status_last_edit.get(skey, 0.0)
+                < STATUS_REFRESH_INTERVAL
+            )
+            if info[2] == status_text or (same_state and fresh):
+                return
+            # Stamped on enqueue, not on the edit: the throttle has to hold
+            # back the next poll a second from now, which arrives long before
+            # this task reaches the front of the queue.
+            _status_last_edit[skey] = time.monotonic()
 
     queue = get_or_create_queue(bot, user_id, thread_id)
 
@@ -830,6 +879,7 @@ def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
     skey = (user_id, thread_id or 0)
     _status_msg_info.pop(skey, None)
+    _status_last_edit.pop(skey, None)
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:
@@ -863,6 +913,7 @@ async def shutdown_topic_queue(user_id: int, thread_id: int | None = None) -> No
             pass
     _message_queues.pop(qkey, None)
     _queue_locks.pop(qkey, None)
+    _status_last_edit.pop(qkey, None)
 
 
 async def shutdown_workers() -> None:
@@ -876,4 +927,5 @@ async def shutdown_workers() -> None:
     _queue_workers.clear()
     _message_queues.clear()
     _queue_locks.clear()
+    _status_last_edit.clear()
     logger.info("Message queue workers stopped")
