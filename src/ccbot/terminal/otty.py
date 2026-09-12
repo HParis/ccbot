@@ -37,7 +37,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from shlex import quote
 
-from .base import Capabilities, ReconnectListener, TerminalSession
+from .base import Capabilities, ReconnectListener, TerminalSession, Workspace
 from .registry import register
 
 logger = logging.getLogger(__name__)
@@ -146,6 +146,8 @@ class OttyManager:
             native_tagging=False,
             reconnect_events=False,
             screenshot=True,
+            # Any directory can host a session.
+            arbitrary_cwd=True,
         )
 
     @property
@@ -324,6 +326,10 @@ class OttyManager:
         self, claude_session_uuids: set[str] | None = None
     ) -> list[TerminalSession]:
         return [self._to_session(p, claude_session_uuids) for p in await self._panes()]
+
+    async def list_workspaces(self) -> list[Workspace]:
+        """Nothing to enumerate: any directory can host a session."""
+        return []
 
     async def bind_existing_session(self, window_id: str, name: str) -> bool:
         if not any(p.get("id") == window_id for p in await self._panes()):

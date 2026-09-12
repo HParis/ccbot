@@ -22,6 +22,7 @@ from ..config import config
 # backend only registers a cheap factory; the selected one is instantiated
 # lazily by ``registry.get`` below.
 from .. import iterm2_manager as _iterm2_backend  # noqa: F401
+from . import orca as _orca_backend  # noqa: F401
 from . import otty as _otty_backend  # noqa: F401
 from .base import TerminalBackend
 from .registry import get as _get_backend

@@ -77,6 +77,24 @@ def is_running_claude(session: TerminalSession) -> bool:
     return any(any(n in sig for n in _CLAUDE_JOB_NAMES) for sig in signals)
 
 
+@dataclass
+class Workspace:
+    """A place a backend is willing to open a session in.
+
+    Only meaningful for backends that declare ``arbitrary_cwd=False``: they
+    host sessions inside registered projects rather than arbitrary
+    directories, so the user picks from this list instead of browsing the
+    filesystem.
+
+    ``path`` is the working directory the session will start in, and is what
+    ccbot stores as the topic's durable rebind target.
+    """
+
+    path: str
+    label: str  # display name (e.g. project name)
+    detail: str = ""  # secondary line, e.g. the checked-out branch
+
+
 @dataclass(frozen=True)
 class Capabilities:
     """Feature flags a backend declares so upper layers can degrade.
@@ -90,6 +108,11 @@ class Capabilities:
     native_tagging: bool  # ownership via a native per-session variable
     reconnect_events: bool  # add_reconnect_listener fires on reconnect
     screenshot: bool  # screenshot_session returns real pixels (not None)
+    # create_window accepts any directory. False means the backend hosts
+    # sessions only inside places it already knows (Orca: registered
+    # worktrees), so upper layers must offer ``list_workspaces`` instead of
+    # a filesystem browser.
+    arbitrary_cwd: bool = True
 
 
 @runtime_checkable
@@ -172,6 +195,14 @@ class TerminalBackend(Protocol):
         self, claude_session_uuids: set[str] | None = None
     ) -> list[TerminalSession]:
         """List all sessions (owned or not) for the bind-existing picker."""
+        ...
+
+    async def list_workspaces(self) -> list[Workspace]:
+        """Places this backend can open a session in.
+
+        Empty for backends with ``arbitrary_cwd=True``: any directory works,
+        so there is nothing to enumerate and the filesystem browser is used.
+        """
         ...
 
     async def bind_existing_session(self, window_id: str, name: str) -> bool:

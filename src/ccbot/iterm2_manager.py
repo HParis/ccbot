@@ -33,7 +33,12 @@ from typing import Any, TypeVar, cast
 import iterm2
 import iterm2.screen as iterm2_screen
 
-from .terminal.base import Capabilities, ReconnectListener, TerminalSession
+from .terminal.base import (
+    Capabilities,
+    ReconnectListener,
+    TerminalSession,
+    Workspace,
+)
 from .terminal.registry import register
 
 logger = logging.getLogger(__name__)
@@ -601,6 +606,8 @@ class ITerm2Manager:
             native_tagging=True,
             reconnect_events=True,
             screenshot=True,
+            # Any directory can host a session.
+            arbitrary_cwd=True,
         )
 
     @property
@@ -737,6 +744,10 @@ class ITerm2Manager:
         )
 
     @_bounded(fallback=False)
+    async def list_workspaces(self) -> list[Workspace]:
+        """Nothing to enumerate: any directory can host a session."""
+        return []
+
     async def bind_existing_session(self, window_id: str, name: str) -> bool:
         """Adopt an existing iTerm2 session into ccbot's pool.
 
