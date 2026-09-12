@@ -1,18 +1,27 @@
-"""Per-user message queue management for ordered message delivery.
+"""Per-topic message queue management for ordered message delivery.
 
 Provides a queue-based message processing system that ensures:
-  - Messages are sent in receive order (FIFO)
+  - Messages are sent in receive order (FIFO) *within* a topic
   - Status messages always follow content messages
   - Consecutive content messages can be merged for efficiency
   - Thread-aware sending: each MessageTask carries an optional thread_id
     for Telegram topic support
 
+Queues are keyed by ``(user_id, thread_id_or_0)`` — one per topic, each
+with its own worker. All of a user's topics share one Telegram supergroup
+and therefore one 20-messages-per-minute budget, so sends are paced at
+roughly one per three seconds no matter how many topics are active. With a
+single queue per user that budget was handed out strictly first-come: a
+chatty topic's backlog of tool calls sat in front of every other topic, and
+a quiet topic could go minutes without a word. Per-topic queues keep the
+shared budget but let every topic compete for it directly.
+
 Rate limiting is handled globally by AIORateLimiter on the Application.
 
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
-  - get_or_create_queue: Get or create queue and worker for a user
-  - Message queue worker: Background task processing user's queue
+  - get_or_create_queue: Get or create queue and worker for one topic
+  - Message queue worker: Background task processing one topic's queue
   - Content task processing with tool_use/tool_result handling
   - Status message tracking and conversion (keyed by (user_id, thread_id))
 """
@@ -69,10 +78,12 @@ class MessageTask:
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
 
 
-# Per-user message queues and worker tasks
-_message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
-_queue_workers: dict[int, asyncio.Task[None]] = {}
-_queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
+# Per-topic message queues and worker tasks, keyed (user_id, thread_id_or_0)
+QueueKey = tuple[int, int]
+
+_message_queues: dict[QueueKey, asyncio.Queue[MessageTask]] = {}
+_queue_workers: dict[QueueKey, asyncio.Task[None]] = {}
+_queue_locks: dict[QueueKey, asyncio.Lock] = {}  # Protect drain/refill operations
 
 # Map (tool_use_id, user_id, thread_id_or_0) -> telegram message_id
 # for editing tool_use messages with results
@@ -83,7 +94,11 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 # posted_at is a monotonic timestamp — see STATUS_REUSE_MAX_AGE.
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str, float]] = {}
 
-# Flood control: user_id -> monotonic time when ban expires
+# Flood control: user_id -> monotonic time when ban expires.
+#
+# Deliberately keyed by user, not by topic: a 429 is Telegram throttling the
+# whole supergroup, so every topic's worker has to back off, not just the one
+# whose send happened to trip it.
 _flood_until: dict[int, float] = {}
 
 # Max seconds to wait for flood control before dropping tasks
@@ -99,21 +114,26 @@ FLOOD_CONTROL_MAX_WAIT = 10
 STATUS_REUSE_MAX_AGE = 90.0
 
 
-def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
-    """Get the message queue for a user (if exists)."""
-    return _message_queues.get(user_id)
+def get_message_queue(
+    user_id: int, thread_id: int | None = None
+) -> asyncio.Queue[MessageTask] | None:
+    """Get the message queue for one topic (if it exists)."""
+    return _message_queues.get((user_id, thread_id or 0))
 
 
-def get_or_create_queue(bot: Bot, user_id: int) -> asyncio.Queue[MessageTask]:
-    """Get or create message queue and worker for a user."""
-    if user_id not in _message_queues:
-        _message_queues[user_id] = asyncio.Queue()
-        _queue_locks[user_id] = asyncio.Lock()
-        # Start worker task for this user
-        _queue_workers[user_id] = asyncio.create_task(
-            _message_queue_worker(bot, user_id)
+def get_or_create_queue(
+    bot: Bot, user_id: int, thread_id: int | None = None
+) -> asyncio.Queue[MessageTask]:
+    """Get or create the message queue and worker for one topic."""
+    qkey = (user_id, thread_id or 0)
+    if qkey not in _message_queues:
+        _message_queues[qkey] = asyncio.Queue()
+        _queue_locks[qkey] = asyncio.Lock()
+        # Start worker task for this topic
+        _queue_workers[qkey] = asyncio.create_task(
+            _message_queue_worker(bot, user_id, thread_id)
         )
-    return _message_queues[user_id]
+    return _message_queues[qkey]
 
 
 def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
@@ -264,11 +284,22 @@ async def _process_content_with_retry(
             await asyncio.sleep(retry_secs)
 
 
-async def _message_queue_worker(bot: Bot, user_id: int) -> None:
-    """Process message tasks for a user sequentially."""
-    queue = _message_queues[user_id]
-    lock = _queue_locks[user_id]
-    logger.info(f"Message queue worker started for user {user_id}")
+async def _message_queue_worker(
+    bot: Bot, user_id: int, thread_id: int | None = None
+) -> None:
+    """Process one topic's message tasks sequentially.
+
+    Topics run concurrently; all the state this touches
+    (``_status_msg_info``, ``_tool_msg_ids``, merging) is already scoped to
+    a single topic, and the shared Telegram budget is enforced below us by
+    AIORateLimiter.
+    """
+    qkey = (user_id, thread_id or 0)
+    queue = _message_queues[qkey]
+    lock = _queue_locks[qkey]
+    logger.info(
+        "Message queue worker started for user %d thread %s", user_id, thread_id
+    )
 
     while True:
         try:
@@ -333,10 +364,19 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
             finally:
                 queue.task_done()
         except asyncio.CancelledError:
-            logger.info(f"Message queue worker cancelled for user {user_id}")
+            logger.info(
+                "Message queue worker cancelled for user %d thread %s",
+                user_id,
+                thread_id,
+            )
             break
         except Exception as e:
-            logger.error(f"Unexpected error in queue worker for user {user_id}: {e}")
+            logger.error(
+                "Unexpected error in queue worker for user %d thread %s: %s",
+                user_id,
+                thread_id,
+                e,
+            )
 
 
 def _send_kwargs(thread_id: int | None) -> dict[str, int]:
@@ -692,8 +732,8 @@ async def _check_and_send_status(
     thread_id: int | None = None,
 ) -> None:
     """Check terminal for status line and send status message if present."""
-    # Skip if there are more messages pending in the queue
-    queue = _message_queues.get(user_id)
+    # Skip if this topic has more messages pending
+    queue = _message_queues.get((user_id, thread_id or 0))
     if queue and not queue.empty():
         return
     w = await terminal_manager.find_window_by_id(window_id)
@@ -728,7 +768,7 @@ async def enqueue_content_message(
         window_id,
         content_type,
     )
-    queue = get_or_create_queue(bot, user_id)
+    queue = get_or_create_queue(bot, user_id, thread_id)
 
     task = MessageTask(
         task_type="content",
@@ -771,7 +811,7 @@ async def enqueue_status_update(
         if info and info[1] == window_id and info[2] == status_text:
             return
 
-    queue = get_or_create_queue(bot, user_id)
+    queue = get_or_create_queue(bot, user_id, thread_id)
 
     if status_text:
         task = MessageTask(
@@ -804,6 +844,25 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
     ]
     for key in keys_to_remove:
         _tool_msg_ids.pop(key, None)
+
+
+async def shutdown_topic_queue(user_id: int, thread_id: int | None = None) -> None:
+    """Stop and forget one topic's queue and worker.
+
+    Called when a topic is closed, deleted, or its binding goes stale — the
+    worker would otherwise idle forever, and anything still queued is
+    output for a topic that no longer wants it.
+    """
+    qkey = (user_id, thread_id or 0)
+    worker = _queue_workers.pop(qkey, None)
+    if worker:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+    _message_queues.pop(qkey, None)
+    _queue_locks.pop(qkey, None)
 
 
 async def shutdown_workers() -> None:

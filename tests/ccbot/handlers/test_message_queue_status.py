@@ -76,19 +76,19 @@ async def test_status_clear_survives_flood_control() -> None:
 
     try:
         await mq.enqueue_status_update(bot, 1, "W", None, thread_id=5)
-        queue = mq._message_queues[1]
+        queue = mq._message_queues[(1, 5)]
         assert queue.qsize() == 1
         assert queue.get_nowait().task_type == "status_clear"
 
         # A cosmetic status *update* is still dropped during a ban.
         await mq.enqueue_status_update(bot, 1, "W", "working…", thread_id=5)
-        assert mq._message_queues[1].qsize() == 0
+        assert mq._message_queues[(1, 5)].qsize() == 0
     finally:
-        worker = mq._queue_workers.pop(1, None)
+        worker = mq._queue_workers.pop((1, 5), None)
         if worker:
             worker.cancel()
-        mq._message_queues.pop(1, None)
-        mq._queue_locks.pop(1, None)
+        mq._message_queues.pop((1, 5), None)
+        mq._queue_locks.pop((1, 5), None)
 
 
 def test_status_clear_is_not_droppable_during_flood() -> None:

@@ -2,10 +2,14 @@
 
 ## Message Queue Architecture
 
-Per-user message queues + worker pattern for all send tasks:
-- Messages are sent in receive order (FIFO)
+Per-**topic** message queues + worker pattern for all send tasks, keyed `(user_id, thread_id_or_0)`:
+- Messages are sent in receive order (FIFO) *within* a topic
 - Status messages always follow content messages
-- Multi-user concurrent processing without interference
+- Topics (and users) process concurrently without interference
+
+**Why per topic, not per user**: every topic lives in one Telegram supergroup and shares its 20-messages-per-minute budget, so `AIORateLimiter` paces sends at roughly one per three seconds no matter how many topics are active. A single per-user queue handed that budget out strictly first-come — a chatty topic's backlog of tool calls sat in front of every other topic, and a quiet one could go minutes without a word (observed: a picker taking 31s to appear, then 3m40s of silence). Per-topic queues keep the shared budget but let each topic compete for it directly. `clear_topic_state` stops a topic's worker when the topic goes away.
+
+Flood control (`_flood_until`) stays keyed by user: a 429 throttles the whole supergroup, so every topic's worker backs off together.
 
 **Message merging**: The worker automatically merges consecutive mergeable content messages on dequeue:
 - Content messages for the same window can be merged (including text, thinking)
