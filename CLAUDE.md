@@ -21,6 +21,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - **1 Topic = 1 Tab = 1 Session** — all internal routing keyed by iTerm2 session UUID, not tab name. Tab names are stored separately as display names. Same directory can have multiple tabs.
 - **ccbot tabs are tagged** with the iTerm2 user variable `user.ccbot=1`. Untagged tabs (the user's own shells) are invisible to the bot.
 - **iTerm2 must stay open** — closing iTerm2 kills every Claude Code session the bot is managing. The bot reconnects automatically when iTerm2 starts again, but in-flight Claude work is lost.
+- **Auto-launch is user-driven only** — `open -a iTerm` fires only from `ensure_running` / `preflight` / `create_window` (i.e. `_get_connection(allow_launch=True)`). Background paths (status polling, screenshots, discovery) must stay passive: macOS quits iTerm2 during shutdown, and a poll that relaunches it registers a new app and cancels the shutdown.
 - **Topic-only** — no backward-compat for non-topic mode. No `active_sessions`, no `/list`, no General topic routing.
 - **No message truncation** at parse layer — splitting only at send layer (`split_message`, 4096 char limit).
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.

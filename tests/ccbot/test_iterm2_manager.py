@@ -349,7 +349,7 @@ async def test_get_connection_raises_after_exhausting_retries(
         patch.object(mgr, "_launch_iterm2", AsyncMock(return_value=True)),
     ):
         with pytest.raises(ConnectionError, match="Python API"):
-            await mgr._get_connection()
+            await mgr._get_connection(allow_launch=True)
 
 
 async def test_get_connection_auto_launches_iterm2_on_failure(
@@ -378,7 +378,7 @@ async def test_get_connection_auto_launches_iterm2_on_failure(
         patch("iterm2.Connection.async_create", flaky_create),
         patch.object(mgr, "_launch_iterm2", launch_mock),
     ):
-        conn = await mgr._get_connection()
+        conn = await mgr._get_connection(allow_launch=True)
 
     assert conn is real_conn
     launch_mock.assert_awaited_once()
@@ -402,7 +402,48 @@ async def test_get_connection_raises_when_open_command_fails(
         patch.object(mgr, "_launch_iterm2", AsyncMock(return_value=False)),
     ):
         with pytest.raises(ConnectionError, match="could not launch"):
+            await mgr._get_connection(allow_launch=True)
+
+
+async def test_passive_call_never_launches_iterm2(monkeypatch: Any) -> None:
+    """Background work (status polling, screenshots, discovery) must not
+    resurrect a closed iTerm2.  macOS quits iTerm2 during shutdown; a
+    poll that relaunches it counts as a newly-started app and cancels
+    the shutdown."""
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+
+    async def always_fail() -> Any:
+        raise OSError("not running")
+
+    mgr = _fresh_manager()
+    launch_mock = AsyncMock(return_value=True)
+    with (
+        patch("iterm2.Connection.async_create", always_fail),
+        patch.object(mgr, "_launch_iterm2", launch_mock),
+    ):
+        with pytest.raises(ConnectionError, match="Not auto-launching"):
             await mgr._get_connection()
+
+    launch_mock.assert_not_awaited()
+
+
+async def test_ensure_running_is_allowed_to_launch(monkeypatch: Any) -> None:
+    """The one user-driven entry point that may start iTerm2."""
+    monkeypatch.setattr("ccbot.iterm2_manager._RECONNECT_DELAYS", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("ccbot.iterm2_manager._LAUNCH_DELAYS", (0.0,))
+
+    async def always_fail() -> Any:
+        raise OSError("not running")
+
+    mgr = _fresh_manager()
+    launch_mock = AsyncMock(return_value=True)
+    with (
+        patch("iterm2.Connection.async_create", always_fail),
+        patch.object(mgr, "_launch_iterm2", launch_mock),
+    ):
+        assert await mgr.ensure_running() is False
+
+    launch_mock.assert_awaited_once()
 
 
 async def test_circuit_breaker_short_circuits_after_failure(

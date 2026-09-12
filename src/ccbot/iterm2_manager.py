@@ -287,24 +287,31 @@ class ITerm2Manager:
                 logger.debug("Failed to launch %s: %s", app_name, e)
         return False
 
-    async def _get_connection(self) -> iterm2.Connection:
+    async def _get_connection(self, allow_launch: bool = False) -> iterm2.Connection:
         """Return a live iTerm2 connection, reconnecting if needed.
 
-        On first failure across the standard backoff, shells out to
-        ``open -a iTerm`` to launch iTerm2 in the background, then
-        retries.  The user no longer has to manually start iTerm2
-        before sending a message in Telegram — the bot resurrects
-        the dependency on demand.
+        With ``allow_launch=True``, a failure across the standard
+        backoff shells out to ``open -a iTerm`` to launch iTerm2 in
+        the background, then retries.  The user no longer has to
+        manually start iTerm2 before sending a message in Telegram —
+        the bot resurrects the dependency on demand.
+
+        ``allow_launch`` defaults to False so that only user-driven
+        actions can resurrect iTerm2.  Background work (status
+        polling every second, screenshots, discovery) must stay
+        passive: during macOS shutdown/logout the system quits
+        iTerm2, and a polling loop that immediately relaunches it
+        registers as a newly-started app and cancels the shutdown.
 
         Honours the circuit breaker: if recent attempts failed
         repeatedly, raises immediately without touching iTerm2.
 
         Raises:
-            ConnectionError: After both the initial backoff and the
-                post-launch retry have failed, or while the breaker
-                is open.  Likely causes: iTerm2 isn't installed, the
-                Python API is disabled, or Launch Services can't
-                find an "iTerm"/"iTerm2" app.
+            ConnectionError: After the initial backoff (plus the
+                post-launch retry when launching was allowed) has
+                failed, or while the breaker is open.  Likely causes:
+                iTerm2 isn't running, isn't installed, or the Python
+                API is disabled.
         """
         # Fast-fail while breaker is open.  Many polling loops call
         # this every second; without the breaker, every call opens a
@@ -329,6 +336,17 @@ class ITerm2Manager:
             if conn is not None:
                 logger.info("Connected to iTerm2 Python API")
             else:
+                if not allow_launch:
+                    # Passive caller: report the failure and let the
+                    # breaker back us off.  iTerm2 stays closed —
+                    # including while macOS is shutting down.
+                    self._trip_breaker()
+                    raise ConnectionError(
+                        "iTerm2 is not reachable (not running, or the Python "
+                        "API is disabled).  Not auto-launching it for a "
+                        "background operation."
+                    ) from err
+
                 # Phase 2: probably not running — try to launch it.
                 logger.info(
                     "iTerm2 unreachable after %d attempts; launching via "
@@ -487,8 +505,11 @@ class ITerm2Manager:
         self._consecutive_failures = 0
         self._circuit_open_until = 0.0
 
-    async def _get_app(self) -> iterm2.App:
+    async def _get_app(self, allow_launch: bool = False) -> iterm2.App:
         """Return a refreshed App handle, reconnecting on disconnect.
+
+        ``allow_launch`` is forwarded to ``_get_connection``: only
+        user-driven callers may start iTerm2 if it isn't running.
 
         Catches broadly because iTerm2's WebSocket layer raises
         ``websockets.exceptions.ConnectionClosedError`` (subclass of
@@ -506,7 +527,7 @@ class ITerm2Manager:
         # either already open (and we just propagate) or the failure
         # was inside _get_connection's launch path.  Either way,
         # don't double-trip.
-        conn = await self._get_connection()
+        conn = await self._get_connection(allow_launch=allow_launch)
 
         # Phase 2: query iTerm2.  Failures here are real (websocket
         # alive but RPC didn't work, e.g. iTerm2 throttled us);
@@ -592,8 +613,10 @@ class ITerm2Manager:
         Opens (and the caller should ``reset_connection``) a connection
         bound to the current event loop. Mirrors the startup check that
         previously called ``_get_connection`` directly.
+
+        Startup is a user-driven action, so this may launch iTerm2.
         """
-        await self._get_connection()
+        await self._get_connection(allow_launch=True)
 
     def reset_connection(self) -> None:
         """Drop the cached connection so the next call reconnects fresh."""
@@ -601,9 +624,15 @@ class ITerm2Manager:
 
     @_bounded(fallback=False)
     async def ensure_running(self) -> bool:
-        """Ensure iTerm2 is up (``_get_app`` auto-launches it); report reach."""
+        """Ensure iTerm2 is up, auto-launching it; report reachability.
+
+        The one entry point that deliberately resurrects iTerm2. Call
+        it from user-driven paths only (sending a message, creating a
+        session) — never from background polling, which must not undo
+        a macOS shutdown by relaunching the app.
+        """
         try:
-            await self._get_app()
+            await self._get_app(allow_launch=True)
             return True
         except ConnectionError:
             return False
@@ -1132,7 +1161,8 @@ class ITerm2Manager:
             counter += 1
 
         try:
-            app = await self._get_app()
+            # User asked for a new session: launching iTerm2 is in scope.
+            app = await self._get_app(allow_launch=True)
         except ConnectionError as e:
             return False, f"iTerm2 unreachable: {e}", "", ""
 
