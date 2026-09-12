@@ -288,6 +288,8 @@ class OttyManager:
             window_name=pane.get("title", "") or "",
             cwd=pane.get("cwd", "") or "",
             pane_current_command=pane.get("process", "") or "",
+            # Otty reports one process name; it serves as both signals.
+            job_title=pane.get("process", "") or "",
             is_ccbot=pid in self._owned,
             has_claude=bool(claude_uuids and pid in claude_uuids),
         )

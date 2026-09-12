@@ -724,12 +724,14 @@ class ITerm2Manager:
         name = await self._get_var(session, "session.name") or ""
         cwd = await self._get_var(session, "session.path") or ""
         job = await self._get_var(session, "session.jobName") or ""
+        title = await self._get_var(session, "session.processTitle") or ""
 
         return ITermWindow(
             window_id=session.session_id,
             window_name=name,
             cwd=cwd,
             pane_current_command=job,
+            job_title=title,
             is_ccbot=is_ccbot,
             has_claude=session.session_id in known,
         )
@@ -803,12 +805,14 @@ class ITerm2Manager:
         name = await self._get_var(session, "session.name") or ""
         cwd = await self._get_var(session, "session.path") or ""
         job = await self._get_var(session, "session.jobName") or ""
+        title = await self._get_var(session, "session.processTitle") or ""
 
         return ITermWindow(
             window_id=session.session_id,
             window_name=name,
             cwd=cwd,
             pane_current_command=job,
+            job_title=title,
         )
 
     @staticmethod

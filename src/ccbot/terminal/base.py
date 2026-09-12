@@ -42,6 +42,11 @@ class TerminalSession:
     window_name: str  # display name
     cwd: str  # current working directory (or "")
     pane_current_command: str = ""  # foreground job name (or "")
+    # Foreground process title, when the backend can report one separately
+    # from the job name. The two diverge: iTerm2's jobName for a running
+    # Claude Code reads as its version string ("2.1.269"), while the process
+    # title reads "claude". Empty means the backend cannot tell us.
+    job_title: str = ""
     is_ccbot: bool = False  # owned/tagged by ccbot
     has_claude: bool = False  # has a session_map.json entry
 

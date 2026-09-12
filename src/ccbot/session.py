@@ -33,6 +33,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
+from .terminal.base import TerminalSession
 from .terminal.manager import terminal_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
@@ -50,6 +51,33 @@ _UUID_RE = re.compile(
 # backend so the hook and the bot agree on the key. Legacy/foreign-prefix
 # entries are filtered out at read time.
 _SESSION_MAP_PREFIX = terminal_manager.session_map_prefix
+
+# Foreground-process names that mean "Claude Code is running here".
+# iTerm2's jobName reads as Claude's version string ("2.1.269") while its
+# processTitle reads "claude"; older builds showed "node-runtime" as the job.
+# Checked case-insensitively against both signals.
+_CLAUDE_JOB_NAMES = ("claude", "node-runtime")
+
+
+def _is_running_claude(session: TerminalSession) -> bool:
+    """Whether a live terminal session looks like it's running Claude Code.
+
+    Used to keep the cwd rebind off a tab whose Claude has exited: its
+    session_map entry (and therefore its hook cwd) survives the exit, so
+    without this a topic could be bound to a plain shell. ``has_claude`` is
+    no help here — it is derived from session_map itself, so it stays True
+    for exactly the tabs this guards against.
+
+    A backend that reports neither signal gets the benefit of the doubt;
+    blocking the rebind on missing information would be worse than the
+    stale-tab case it prevents.
+    """
+    signals = [
+        x.lower() for x in (session.job_title, session.pane_current_command) if x
+    ]
+    if not signals:
+        return True
+    return any(any(n in sig for n in _CLAUDE_JOB_NAMES) for sig in signals)
 
 
 @dataclass
@@ -947,6 +975,17 @@ class SessionManager:
         whose cwd equals its target — only when EXACTLY ONE candidate exists, to
         avoid grabbing the wrong tab — re-tag it (adopt) and bind.  Returns the
         number of topics rebound.
+
+        The cwd compared is the hook's, not the terminal's.  iTerm2 reports
+        ``session.path`` from shell integration, which only fires when a
+        prompt is drawn: a tab started with ``cd <dir> && claude`` — the form
+        ccbot itself uses — never draws another prompt, so the terminal keeps
+        reporting the directory the user was in *before* pressing return
+        (usually ``~``) for the whole life of the session.  Measured on a live
+        instance, 5 of 7 tabs reported ``/Users/paris``, so matching on it
+        silently rebound nothing.  The SessionStart hook records the directory
+        Claude itself reported, which matched every running process's real cwd.
+        ``session.cwd`` stays the fallback for sessions with no hook entry.
         """
 
         # Cheap pre-check (no network): a targeted topic needs rebinding if it
@@ -970,6 +1009,7 @@ class SessionManager:
             return 0
 
         sessions = await terminal_manager.list_all_sessions()
+        hook_cwds = self.load_session_map_cwds()
         live_ids = {s.window_id for s in sessions}
         bound = {wid for _, _, wid in self.iter_thread_bindings()}
         claimed: set[str] = set()
@@ -982,14 +1022,16 @@ class SessionManager:
                 candidates = [
                     s
                     for s in sessions
-                    if s.cwd == target_cwd
+                    if (hook_cwds.get(s.window_id) or s.cwd) == target_cwd
                     and s.window_id not in bound
                     and s.window_id not in claimed
+                    and _is_running_claude(s)
                 ]
                 if len(candidates) != 1:
                     continue  # 0 = not open yet; >1 = ambiguous, wait it out
                 sess = candidates[0]
                 name = sess.window_name or Path(target_cwd).name
+                via = "hook" if hook_cwds.get(sess.window_id) else "terminal"
                 # Re-tag untagged (reboot-orphaned) tabs so the rest of the
                 # pipeline can drive them again; already-tagged ones skip this.
                 if not sess.is_ccbot:
@@ -1004,11 +1046,13 @@ class SessionManager:
                 bound.add(sess.window_id)
                 count += 1
                 logger.info(
-                    "Auto-rebound topic by cwd: user=%d thread=%d -> %s (cwd=%s)",
+                    "Auto-rebound topic by cwd: user=%d thread=%d -> %s "
+                    "(cwd=%s via %s)",
                     uid,
                     tid,
                     sess.window_id,
                     target_cwd,
+                    via,
                 )
         return count
 

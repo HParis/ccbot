@@ -944,3 +944,163 @@ class TestLoadSessionMapCwds:
             session_mod.config, "session_map_file", tmp_path / "missing.json"
         )
         assert SessionManager().load_session_map_cwds() == {}
+
+
+class TestRebindUsesHookCwd:
+    """iTerm2's session.path only updates when a prompt is drawn, so a tab
+    started with `cd <dir> && claude` reports the pre-cd directory (usually
+    ~) forever. The SessionStart hook records the directory Claude itself
+    reported, so the rebind matches on that and keeps session.path as the
+    fallback.
+    """
+
+    @staticmethod
+    def _sess(wid, name, cwd, job="claude"):
+        from ccbot.iterm2_manager import ITermWindow
+
+        return ITermWindow(wid, name, cwd, job, job_title=job)
+
+    @staticmethod
+    def _hook_map(monkeypatch, tmp_path, entries: dict[str, str]):
+        import json
+
+        from ccbot import session as session_mod
+
+        f = tmp_path / "session_map.json"
+        f.write_text(
+            json.dumps(
+                {
+                    f"iterm:{k}": {"session_id": "s", "cwd": v}
+                    for k, v in entries.items()
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "session_map_file", f)
+
+    async def test_hook_cwd_wins_over_stale_terminal_cwd(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        # What iTerm2 reports for a `cd /p/dev && claude` tab: the home dir.
+        sess = self._sess("NEW", "Dev", "/Users/paris")
+        self._hook_map(monkeypatch, tmp_path, {"NEW": "/p/dev"})
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 1
+        assert mgr.get_window_for_thread(100, 42) == "NEW"
+
+    async def test_terminal_cwd_is_the_fallback_without_a_hook_entry(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        sess = self._sess("NEW", "Dev", "/p/dev")
+        self._hook_map(monkeypatch, tmp_path, {})  # hook never fired here
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 1
+        assert mgr.get_window_for_thread(100, 42) == "NEW"
+
+    async def test_hook_cwd_for_another_tab_does_not_match(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """A hook entry belongs to one window_id — it must not leak across."""
+        from unittest.mock import AsyncMock, patch
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        sess = self._sess("NEW", "Dev", "/Users/paris")
+        self._hook_map(monkeypatch, tmp_path, {"OTHER": "/p/dev"})
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 0
+        assert mgr.get_window_for_thread(100, 42) is None
+
+    async def test_tab_whose_claude_exited_is_not_adopted(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """The hook entry outlives the Claude process, so the cwd still
+        matches after the user quits Claude and keeps using the shell.
+        Binding a topic to that shell would send its messages nowhere.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        sess = self._sess("NEW", "Dev", "/Users/paris", job="zsh")
+        self._hook_map(monkeypatch, tmp_path, {"NEW": "/p/dev"})
+        # Adoption is patched to succeed so the *only* thing that can stop
+        # the rebind is the running-job check.
+        bes = AsyncMock(return_value=True)
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch("ccbot.session.terminal_manager.bind_existing_session", bes),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 0
+        assert mgr.get_window_for_thread(100, 42) is None
+        bes.assert_not_awaited()
+
+    async def test_backend_without_job_signals_still_rebinds(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """No signal at all means "can't tell", not "not Claude"."""
+        from unittest.mock import AsyncMock, patch
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        sess = self._sess("NEW", "Dev", "/p/dev", job="")
+        self._hook_map(monkeypatch, tmp_path, {})
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[sess]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            n = await mgr.rebind_unresolved()
+        assert n == 1
+
+    def test_version_string_job_name_still_counts_as_claude(self) -> None:
+        """iTerm2's jobName for a running Claude is its version ("2.1.269"),
+        so the processTitle is the signal that identifies it."""
+        from ccbot.iterm2_manager import ITermWindow
+        from ccbot.session import _is_running_claude
+
+        real = ITermWindow("W", "Main", "/p", "2.1.269", job_title="claude")
+        assert _is_running_claude(real)
+        shell = ITermWindow("W", "Main", "/p", "zsh", job_title="zsh")
+        assert not _is_running_claude(shell)
