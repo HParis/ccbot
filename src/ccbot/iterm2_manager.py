@@ -98,6 +98,11 @@ _SPECIAL_KEYS: dict[str, str] = {
     "Escape": "\x1b",
     "Tab": "\t",
     "Enter": "\r",
+    # The picker keyboard sends "Space" for its ␣ button. Without an entry
+    # here it fell through the permissive branch below and typed the five
+    # letters S-p-a-c-e into the TUI — and Space is exactly the key an
+    # AskUserQuestion checkbox needs, so the button was worse than inert.
+    "Space": " ",
 }
 
 # Claude Code's TUI sometimes interprets a rapid Enter that arrives in

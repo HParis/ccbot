@@ -704,6 +704,11 @@ async def test_send_keys_bash_prefix_alone_skips_extra_send(
         ("Escape", "\x1b"),
         ("Tab", "\t"),
         ("Enter", "\r"),
+        # The picker keyboard's "␣ Space" button. Missing from the table, it
+        # fell through the permissive branch below and typed the five letters
+        # S-p-a-c-e into the TUI — the one key an AskUserQuestion checkbox
+        # actually needs.
+        ("Space", " "),
     ],
 )
 async def test_send_keys_special_keys_translate_correctly(

@@ -72,6 +72,10 @@ _SPECIAL_KEYS: dict[str, str] = {
     "Escape": "key:Escape",
     "Tab": "key:Tab",
     "Enter": "key:Enter",
+    # A literal space, not a guessed ``key:Space`` name: unlisted values are
+    # sent verbatim anyway, and a space character is unambiguous. Without an
+    # entry the picker's ␣ button typed the word "Space" into the TUI.
+    "Space": " ",
 }
 
 # (returncode, stdout, stderr)

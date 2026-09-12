@@ -318,3 +318,11 @@ async def test_create_window_injects_session_key_when_starting_claude(
     # tab new must NOT carry --command (2-phase: shell first, then claude).
     tab_new = next(c for c in fake.calls if "tab" in c and "new" in c)
     assert "--command" not in tab_new
+
+
+def test_send_keys_space_sends_a_space_not_the_word() -> None:
+    """The picker's ␣ button must produce a space character. Unmapped, it
+    fell through the verbatim branch and typed S-p-a-c-e into the TUI."""
+    from ccbot.terminal.otty import _SPECIAL_KEYS
+
+    assert _SPECIAL_KEYS["Space"] == " "

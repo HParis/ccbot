@@ -207,9 +207,14 @@ class TestResolveStaleIdsTmuxMigration:
 
     async def test_drops_unrecoverable_legacy_binding(self, monkeypatch) -> None:
         """When the display name has no live iTerm2 match, the binding
-        is dropped so the topic falls into the unbound-topic flow."""
+        is dropped so the topic falls into the unbound-topic flow.
+
+        Requires at least one live tab: a fully empty live set is
+        untrustworthy and handled by the guard tests below.
+        """
         from unittest.mock import AsyncMock, patch
 
+        from ccbot.iterm2_manager import ITermWindow
         from ccbot.session import SessionManager, WindowState
 
         mgr = SessionManager()
@@ -217,13 +222,125 @@ class TestResolveStaleIdsTmuxMigration:
         mgr.window_states = {"@5": WindowState(window_name="gone", cwd="/tmp")}
         mgr.window_display_names = {"@5": "gone"}
 
+        unrelated = [
+            ITermWindow(
+                window_id="9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB",
+                window_name="something-else",
+                cwd="/tmp",
+                pane_current_command="",
+            )
+        ]
         with patch(
-            "ccbot.session.terminal_manager.list_windows", AsyncMock(return_value=[])
+            "ccbot.session.terminal_manager.list_windows",
+            AsyncMock(return_value=unrelated),
         ):
             await mgr.resolve_stale_ids()
 
         assert 42 not in mgr.thread_bindings.get(1, {})
         assert "@5" not in mgr.window_states
+
+
+class TestResolveStaleIdsRefusesEmptyLiveSet:
+    """A transient backend drop at startup must never be read as
+    "every tab was closed".
+
+    Regression: list_windows() returns [] both for "no tabs" and for
+    "unreachable". On a startup that raced the iTerm2 WebSocket coming
+    up, every thread binding was dropped AND every session_map entry was
+    purged. Bindings self-healed via cwd auto-rebind, but session_map
+    only gets rewritten by the SessionStart hook — which never fires for
+    an already-running Claude — so Claude→Telegram went silently dead
+    for every topic until the map was rebuilt by hand.
+    """
+
+    async def test_unreachable_backend_leaves_state_intact(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.session import SessionManager, WindowState
+
+        wid = "F515BBC6-800A-4EDD-9EAF-FF8AA32F2FE0"
+        mgr = SessionManager()
+        mgr.thread_bindings = {1: {49177: wid}}
+        mgr.window_states = {wid: WindowState(window_name="Quin-Global", cwd="/tmp")}
+        mgr.window_display_names = {wid: "Quin-Global"}
+
+        cleanup = AsyncMock()
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_windows",
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.is_reachable",
+                lambda: False,
+            ),
+            patch.object(mgr, "_cleanup_stale_session_map_entries", cleanup),
+        ):
+            await mgr.resolve_stale_ids()
+
+        assert mgr.thread_bindings[1][49177] == wid
+        assert wid in mgr.window_states
+        cleanup.assert_not_awaited()
+
+    async def test_reachable_but_zero_tabs_leaves_state_intact(self) -> None:
+        """Even a "successful" empty read is too weak to destroy state on."""
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.session import SessionManager, WindowState
+
+        wid = "F515BBC6-800A-4EDD-9EAF-FF8AA32F2FE0"
+        mgr = SessionManager()
+        mgr.thread_bindings = {1: {49177: wid}}
+        mgr.window_states = {wid: WindowState(window_name="Quin-Global", cwd="/tmp")}
+        mgr.window_display_names = {wid: "Quin-Global"}
+
+        cleanup = AsyncMock()
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_windows",
+                AsyncMock(return_value=[]),
+            ),
+            patch("ccbot.session.terminal_manager.is_reachable", lambda: True),
+            patch.object(mgr, "_cleanup_stale_session_map_entries", cleanup),
+        ):
+            await mgr.resolve_stale_ids()
+
+        assert mgr.thread_bindings[1][49177] == wid
+        assert wid in mgr.window_states
+        cleanup.assert_not_awaited()
+
+    async def test_empty_list_all_sessions_skips_session_map_purge(self) -> None:
+        """list_windows succeeding doesn't mean list_all_sessions did."""
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITermWindow
+        from ccbot.session import SessionManager
+
+        live = [
+            ITermWindow(
+                window_id="9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB",
+                window_name="Quin-Global",
+                cwd="/tmp",
+                pane_current_command="",
+            )
+        ]
+        mgr = SessionManager()
+        cleanup = AsyncMock()
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_windows",
+                AsyncMock(return_value=live),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[]),
+            ),
+            patch("ccbot.session.terminal_manager.is_reachable", lambda: True),
+            patch.object(mgr, "_cleanup_stale_session_map_entries", cleanup),
+        ):
+            await mgr.resolve_stale_ids()
+
+        cleanup.assert_not_awaited()
 
 
 class TestSendToWindowStaleUuidFallback:
@@ -392,14 +509,26 @@ class TestSessionMapCleanupHonoursUntaggedTabs:
 
         mgr = SessionManager()
 
+        # A live tab must be present for "absent" to mean anything: an empty
+        # live set is indistinguishable from an unreachable backend, and
+        # resolve_stale_ids deliberately refuses to purge on that signal.
+        from ccbot.iterm2_manager import ITermWindow
+
+        live = ITermWindow(
+            window_id="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+            window_name="alive",
+            cwd="/tmp/alive",
+            pane_current_command="",
+        )
+
         with (
             patch(
                 "ccbot.session.terminal_manager.list_windows",
-                AsyncMock(return_value=[]),
+                AsyncMock(return_value=[live]),
             ),
             patch(
                 "ccbot.session.terminal_manager.list_all_sessions",
-                AsyncMock(return_value=[]),
+                AsyncMock(return_value=[live]),
             ),
         ):
             await mgr.resolve_stale_ids()
@@ -785,3 +914,33 @@ class TestThreadTargets:
         assert n == 1
         assert mgr.get_window_for_thread(100, 42) == "NEW"
         bes.assert_awaited_once()
+
+
+class TestLoadSessionMapCwds:
+    def test_returns_hook_cwd_per_window(self, tmp_path, monkeypatch) -> None:
+        import json
+
+        from ccbot import session as session_mod
+        from ccbot.session import SessionManager
+
+        f = tmp_path / "session_map.json"
+        f.write_text(
+            json.dumps(
+                {
+                    "iterm:AAA": {"session_id": "s1", "cwd": "/x/dev"},
+                    "iterm:BBB": {"session_id": "s2", "cwd": ""},
+                    "ccbot:@1": {"session_id": "s3", "cwd": "/legacy"},
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "session_map_file", f)
+        assert SessionManager().load_session_map_cwds() == {"AAA": "/x/dev"}
+
+    def test_missing_file_is_empty(self, tmp_path, monkeypatch) -> None:
+        from ccbot import session as session_mod
+        from ccbot.session import SessionManager
+
+        monkeypatch.setattr(
+            session_mod.config, "session_map_file", tmp_path / "missing.json"
+        )
+        assert SessionManager().load_session_map_cwds() == {}

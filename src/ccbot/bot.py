@@ -105,6 +105,7 @@ from .handlers.directory_browser import (
     clear_browse_state,
     clear_session_picker_state,
     clear_window_picker_state,
+    picker_label,
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
@@ -918,6 +919,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # browser only when nothing adoptable is open.
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         known_claude_uuids = set(session_manager._load_session_map_by_window().keys())
+        hook_cwds = session_manager.load_session_map_cwds()
         all_sessions = await terminal_manager.list_all_sessions(known_claude_uuids)
         candidates = [s for s in all_sessions if s.window_id not in bound_ids]
         logger.debug(
@@ -928,22 +930,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
         if candidates:
-            # Derive a useful display name per session: prefer the cwd
-            # basename so manually-opened tabs (whose iTerm2 session
-            # name defaults to the profile, often "Default") still
-            # show as "ccbot" / "main" / etc. in the picker.  Matches
-            # the name we lock when binding (CB_WIN_BIND below).
-            def _picker_label(name: str, cwd: str) -> str:
-                if cwd:
-                    base = Path(cwd).name
-                    if base:
-                        return base
-                return name or "(unnamed)"
-
-            window_tuples = [
-                (s.window_id, _picker_label(s.window_name, s.cwd), s.cwd, s.has_claude)
-                for s in candidates
-            ]
+            # The hook's cwd beats iTerm2's session.path: without shell
+            # integration the latter never leaves the profile's start
+            # directory, so every tab would read as "~".
+            window_tuples = []
+            for s in candidates:
+                cwd = hook_cwds.get(s.window_id) or s.cwd
+                window_tuples.append(
+                    (s.window_id, picker_label(s.window_name, cwd), cwd, s.has_claude)
+                )
             logger.info(
                 "Unbound topic: showing tab picker (%d candidates, user=%d, thread=%d)",
                 len(candidates),
@@ -1216,6 +1211,61 @@ async def _create_and_bind_window(
 
 
 # --- Callback query handler ---
+
+
+async def _send_picker_key(
+    query: Any,
+    bot: Bot,
+    user_id: int,
+    data: str,
+    prefix: str,
+    key: str,
+    label: str,
+    thread_id: int | None,
+    refresh: bool = True,
+) -> None:
+    """Forward one picker keystroke to the terminal and refresh the picker.
+
+    Every failure here used to be silent: an unresolvable window (the UUID
+    baked into a pre-restart message no longer exists) or a rejected send
+    both ended in a bare ``query.answer()``, so the button simply did
+    nothing and the user had no way to tell a dead button from a busy one.
+    """
+    window_id = data[len(prefix) :]
+    w = await terminal_manager.find_window_by_id(window_id)
+    if not w:
+        logger.warning(
+            "Picker key %s: window %s no longer exists (user=%d thread=%s)",
+            key,
+            window_id,
+            user_id,
+            thread_id,
+        )
+        await query.answer(
+            "This tab is gone — send a message in the topic to rebind.",
+            show_alert=True,
+        )
+        return
+
+    sent = await terminal_manager.send_keys(
+        w.window_id, key, enter=False, literal=False
+    )
+    logger.info(
+        "Picker key %s -> window %s (user=%d thread=%s): %s",
+        key,
+        window_id,
+        user_id,
+        thread_id,
+        "sent" if sent else "FAILED",
+    )
+    if not sent:
+        await query.answer("Could not reach the terminal.", show_alert=True)
+        return
+
+    if refresh:
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(bot, user_id, window_id, thread_id)
+    await query.answer(label)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1578,15 +1628,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         cwd = entry[2] if entry else ""
         has_claude = bool(entry[3]) if entry else False
 
-        # Compute a sensible display name: prefer the cwd basename
-        # over iTerm2's auto-generated "host — path" string.  Falls
-        # back to the original session name if cwd is empty.
-        if cwd:
-            from pathlib import Path as _Path
-
-            display = _Path(cwd).name or original_name
-        else:
-            display = original_name
+        # entry[1] is already the picker label (tab name, or cwd
+        # basename when the name is a profile default) — lock that
+        # same name so the topic matches what the user tapped.
+        display = original_name
 
         # Adopt the session: tag with user.ccbot=1 + lock its name.
         # After this call find_window_by_id will see it.
@@ -1724,106 +1769,110 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Interactive UI: Up arrow
     elif data.startswith(CB_ASK_UP):
-        window_id = data[len(CB_ASK_UP) :]
-        thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Up", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_UP,
+            "Up",
+            "↑",
+            _get_thread_id(update),
+        )
 
     # Interactive UI: Down arrow
     elif data.startswith(CB_ASK_DOWN):
-        window_id = data[len(CB_ASK_DOWN) :]
-        thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Down", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_DOWN,
+            "Down",
+            "↓",
+            _get_thread_id(update),
+        )
 
     # Interactive UI: Left arrow
     elif data.startswith(CB_ASK_LEFT):
-        window_id = data[len(CB_ASK_LEFT) :]
-        thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Left", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_LEFT,
+            "Left",
+            "←",
+            _get_thread_id(update),
+        )
 
     # Interactive UI: Right arrow
     elif data.startswith(CB_ASK_RIGHT):
-        window_id = data[len(CB_ASK_RIGHT) :]
-        thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Right", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_RIGHT,
+            "Right",
+            "→",
+            _get_thread_id(update),
+        )
 
     # Interactive UI: Escape
     elif data.startswith(CB_ASK_ESC):
-        window_id = data[len(CB_ASK_ESC) :]
         thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Escape", enter=False, literal=False
-            )
-            await clear_interactive_msg(user.id, context.bot, thread_id)
-        await query.answer("⎋ Esc")
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_ESC,
+            "Escape",
+            "⎋ Esc",
+            thread_id,
+            refresh=False,
+        )
+        await clear_interactive_msg(user.id, context.bot, thread_id)
 
     # Interactive UI: Enter
     elif data.startswith(CB_ASK_ENTER):
-        window_id = data[len(CB_ASK_ENTER) :]
-        thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Enter", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("⏎ Enter")
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_ENTER,
+            "Enter",
+            "⏎ Enter",
+            _get_thread_id(update),
+        )
 
     # Interactive UI: Space
     elif data.startswith(CB_ASK_SPACE):
-        window_id = data[len(CB_ASK_SPACE) :]
-        thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Space", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("␣ Space")
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_SPACE,
+            "Space",
+            "␣ Space",
+            _get_thread_id(update),
+        )
 
     # Interactive UI: Tab
     elif data.startswith(CB_ASK_TAB):
-        window_id = data[len(CB_ASK_TAB) :]
-        thread_id = _get_thread_id(update)
-        w = await terminal_manager.find_window_by_id(window_id)
-        if w:
-            await terminal_manager.send_keys(
-                w.window_id, "Tab", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("⇥ Tab")
+        await _send_picker_key(
+            query,
+            context.bot,
+            user.id,
+            data,
+            CB_ASK_TAB,
+            "Tab",
+            "⇥ Tab",
+            _get_thread_id(update),
+        )
 
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):

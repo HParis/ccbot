@@ -84,6 +84,33 @@ def clear_session_picker_state(user_data: dict | None) -> None:
         user_data.pop(SESSIONS_KEY, None)
 
 
+# iTerm2 session names that carry no information: the profile default,
+# a bare shell name, or the user's login name.
+_GENERIC_TAB_NAMES = frozenset(
+    {"", "default", "zsh", "bash", "fish", "sh", "login", "shell", "-zsh", "-bash"}
+)
+
+
+def picker_label(name: str, cwd: str) -> str:
+    """Pick a display label for a tab in the adopt-tab picker.
+
+    Prefers the tab's own name — a user who named a tab "Surge" wants
+    to see "Surge".  Falls back to the cwd basename only when the name
+    is a profile default (e.g. "Default", "zsh") or missing, and to
+    "(unnamed)" when neither is usable.  iTerm2's ``session.path`` is
+    often stale (``~``) without shell integration, which is why the
+    cwd is the fallback rather than the primary source.
+    """
+    clean = (name or "").strip()
+    if clean.lower() not in _GENERIC_TAB_NAMES and clean != Path.home().name:
+        return clean
+    if cwd:
+        base = Path(cwd).name
+        if base and base != Path.home().name:
+            return base
+    return clean or "(unnamed)"
+
+
 def build_window_picker(
     windows: list[tuple[str, str, str, bool]],
     page: int = 0,

@@ -239,8 +239,31 @@ class SessionManager:
         2. Stale IDs: window_id no longer exists but display name matches a live window
 
         Builds {window_name: window_id} from live windows, then remaps or drops entries.
+
+        Every pass below is destructive: an ID absent from the live set is
+        dropped. ``list_windows`` returns [] both for "no tabs" and for
+        "backend unreachable", so a transient WebSocket drop at startup would
+        read as "every tab was closed" and wipe all bindings plus every
+        session_map entry — leaving Claude→Telegram silently dead until each
+        session's SessionStart hook fires again. Refuse to act on an empty
+        live set that we can't trust.
         """
         windows = await terminal_manager.list_windows()
+        if not windows and not terminal_manager.is_reachable():
+            logger.warning(
+                "Terminal backend unreachable; skipping stale-ID re-resolution "
+                "(state left intact)"
+            )
+            return
+        if not windows and (self.window_states or any(self.thread_bindings.values())):
+            # Reachable but reporting zero tabs while we still hold state.
+            # Keeping stale entries is harmless (status polling prunes them
+            # once the backend is confirmed healthy); wiping them is not.
+            logger.warning(
+                "Backend reports zero sessions but state is non-empty; "
+                "skipping stale-ID re-resolution"
+            )
+            return
         live_by_name: dict[str, str] = {}  # window_name -> window_id
         live_ids: set[str] = set()
         for w in windows:
@@ -388,6 +411,12 @@ class SessionManager:
         # `claude` gets typed into a tab that already has Claude open.
         # Use the unfiltered live set instead.
         all_live = await terminal_manager.list_all_sessions()
+        if not all_live:
+            # Same ambiguity as list_windows above: [] means "unreachable" as
+            # often as "no sessions". Purging session_map on a bad read kills
+            # the monitor's watch list for sessions that are very much alive.
+            logger.warning("Backend returned no sessions; skipping session_map cleanup")
+            return
         all_live_ids = {w.window_id for w in all_live}
         await self._cleanup_stale_session_map_entries(all_live_ids)
         await self._cleanup_old_format_session_map_keys()
@@ -1046,6 +1075,27 @@ class SessionManager:
             if key.startswith(prefix):
                 wid = key[len(prefix) :]
                 result[wid] = info.get("session_id", "")
+        return result
+
+    def load_session_map_cwds(self) -> dict[str, str]:
+        """Return {window_id: cwd} from session_map.json.
+
+        The hook records Claude's real working directory; iTerm2's own
+        ``session.path`` only tracks ``cd`` when shell integration is
+        installed and otherwise reports the profile's start directory
+        (typically ``~``), so the hook value is the authoritative one.
+        """
+        try:
+            data = json.loads(config.session_map_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        prefix = _SESSION_MAP_PREFIX
+        result: dict[str, str] = {}
+        for key, info in data.items():
+            if key.startswith(prefix) and isinstance(info, dict):
+                cwd = info.get("cwd") or ""
+                if cwd:
+                    result[key[len(prefix) :]] = cwd
         return result
 
     # --- Tmux helpers ---
