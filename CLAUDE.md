@@ -51,8 +51,25 @@ import `terminal_manager` from `ccbot.terminal.manager` — never a concrete bac
   tab, then sends `CCBOT_SESSION_KEY=otty:<pane_id> claude …` so the hook can
   write the key the bot waits on (Otty has no per-pane env id).
 
+- **orca** (`CCBOT_BACKEND=orca`): drives the `orca` CLI. Requires the Orca
+  app running (the backend launches it via `orca open` when needed).
+  Capabilities: no ANSI-color capture, no native ownership tag, no reconnect
+  events, and — unique so far — `arbitrary_cwd=False`. Session id = terminal
+  handle (`term_<uuid>`). Sessions live in **registered worktrees only**:
+  `terminal create` rejects an unregistered path and even a subdirectory of a
+  registered project, so upper layers show a project picker
+  (`list_workspaces` → `orca worktree list`) instead of the filesystem
+  browser. `capture_pane` must pass `--screen`: the default read returns
+  accumulated output in which every repaint is stacked. `send_keys` maps
+  named keys to raw escape sequences — `terminal send --text` is
+  byte-transparent. Like Otty, it types `CCBOT_SESSION_KEY=orca:<handle>
+  claude …` so the hook can write the key the bot waits on.
+
 Adding a terminal = one backend file + `register("name")`. Capability flags
-drive graceful degradation; never branch on the backend name in upper layers.
+drive graceful degradation; never branch on the backend name in upper layers —
+`arbitrary_cwd` is the one that changes the UI rather than just the fidelity,
+switching session creation between the directory browser and the project
+picker.
 The SessionStart hook is backend-agnostic: it writes `CCBOT_SESSION_KEY` if set,
 else derives the key from `ITERM_SESSION_ID`.
 
