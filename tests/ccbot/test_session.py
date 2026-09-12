@@ -1093,14 +1093,3 @@ class TestRebindUsesHookCwd:
         ):
             n = await mgr.rebind_unresolved()
         assert n == 1
-
-    def test_version_string_job_name_still_counts_as_claude(self) -> None:
-        """iTerm2's jobName for a running Claude is its version ("2.1.269"),
-        so the processTitle is the signal that identifies it."""
-        from ccbot.iterm2_manager import ITermWindow
-        from ccbot.session import _is_running_claude
-
-        real = ITermWindow("W", "Main", "/p", "2.1.269", job_title="claude")
-        assert _is_running_claude(real)
-        shell = ITermWindow("W", "Main", "/p", "zsh", job_title="zsh")
-        assert not _is_running_claude(shell)

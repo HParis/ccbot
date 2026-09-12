@@ -51,6 +51,32 @@ class TerminalSession:
     has_claude: bool = False  # has a session_map.json entry
 
 
+# Foreground-process names that mean "Claude Code is running here".
+# iTerm2's jobName reads as Claude's version string ("2.1.269") while its
+# processTitle reads "claude"; older builds showed "node-runtime" as the job.
+# Matched case-insensitively as substrings against both signals.
+_CLAUDE_JOB_NAMES = ("claude", "node-runtime")
+
+
+def is_running_claude(session: TerminalSession) -> bool:
+    """Whether a live session's foreground process looks like Claude Code.
+
+    Needed wherever session_map is not proof: a session_map entry (and so
+    ``has_claude``) outlives the Claude process that created it, staying True
+    for a tab whose Claude has exited and which is now a plain shell.
+
+    A backend that reports neither signal gets the benefit of the doubt —
+    treating "can't tell" as "not Claude" would break every caller on a
+    backend that can't introspect its jobs.
+    """
+    signals = [
+        x.lower() for x in (session.job_title, session.pane_current_command) if x
+    ]
+    if not signals:
+        return True
+    return any(any(n in sig for n in _CLAUDE_JOB_NAMES) for sig in signals)
+
+
 @dataclass(frozen=True)
 class Capabilities:
     """Feature flags a backend declares so upper layers can degrade.

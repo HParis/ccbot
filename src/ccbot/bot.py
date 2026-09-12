@@ -138,6 +138,7 @@ from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from . import telemetry
 from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal.base import is_running_claude
 from .terminal.manager import terminal_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
@@ -1654,14 +1655,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
         # If session_map says Claude isn't here, double-check the tab's
-        # foreground command before typing `claude`. iTerm2 reports the
-        # job as "node-runtime" when Claude is running; if so, the
-        # session_map entry just wasn't recorded (e.g. the old cleanup
-        # bug wiped it) and typing `claude` would land as user input.
-        # Discover the session_id ourselves and adopt it instead.
+        # foreground process before typing `claude`: the session_map entry
+        # may just not have been recorded (e.g. the old cleanup bug wiped
+        # it), and typing `claude` into a tab already running it lands as
+        # user input. Discover the session_id ourselves and adopt instead.
+        # The old check compared the job name to "node-runtime"; current
+        # Claude Code reports its version there ("2.1.269"), so this went
+        # dead — is_running_claude consults the process title too.
         if not has_claude:
             tab = await terminal_manager.find_window_by_id(selected_wid)
-            if tab is not None and tab.pane_current_command == "node-runtime":
+            if tab is not None and is_running_claude(tab):
                 claimed = await session_manager.claim_running_claude(selected_wid, cwd)
                 if claimed:
                     has_claude = True

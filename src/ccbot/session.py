@@ -33,7 +33,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .terminal.base import TerminalSession
+from .terminal.base import is_running_claude
 from .terminal.manager import terminal_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
@@ -51,33 +51,6 @@ _UUID_RE = re.compile(
 # backend so the hook and the bot agree on the key. Legacy/foreign-prefix
 # entries are filtered out at read time.
 _SESSION_MAP_PREFIX = terminal_manager.session_map_prefix
-
-# Foreground-process names that mean "Claude Code is running here".
-# iTerm2's jobName reads as Claude's version string ("2.1.269") while its
-# processTitle reads "claude"; older builds showed "node-runtime" as the job.
-# Checked case-insensitively against both signals.
-_CLAUDE_JOB_NAMES = ("claude", "node-runtime")
-
-
-def _is_running_claude(session: TerminalSession) -> bool:
-    """Whether a live terminal session looks like it's running Claude Code.
-
-    Used to keep the cwd rebind off a tab whose Claude has exited: its
-    session_map entry (and therefore its hook cwd) survives the exit, so
-    without this a topic could be bound to a plain shell. ``has_claude`` is
-    no help here — it is derived from session_map itself, so it stays True
-    for exactly the tabs this guards against.
-
-    A backend that reports neither signal gets the benefit of the doubt;
-    blocking the rebind on missing information would be worse than the
-    stale-tab case it prevents.
-    """
-    signals = [
-        x.lower() for x in (session.job_title, session.pane_current_command) if x
-    ]
-    if not signals:
-        return True
-    return any(any(n in sig for n in _CLAUDE_JOB_NAMES) for sig in signals)
 
 
 @dataclass
@@ -1025,7 +998,7 @@ class SessionManager:
                     if (hook_cwds.get(s.window_id) or s.cwd) == target_cwd
                     and s.window_id not in bound
                     and s.window_id not in claimed
-                    and _is_running_claude(s)
+                    and is_running_claude(s)
                 ]
                 if len(candidates) != 1:
                     continue  # 0 = not open yet; >1 = ambiguous, wait it out
