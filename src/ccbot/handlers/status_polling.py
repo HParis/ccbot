@@ -24,15 +24,24 @@ from telegram import Bot
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import is_interactive_ui, parse_status_line
+from ..terminal_parser import (
+    extract_interactive_content,
+    is_interactive_ui,
+    parse_status_line,
+)
 from ..terminal.manager import terminal_manager
 from .interactive_ui import (
+    INTERACTIVE_TOOL_NAMES,
     clear_interactive_msg,
     get_interactive_window,
-    handle_interactive_ui,
+    set_interactive_mode,
 )
 from .cleanup import clear_topic_state
-from .message_queue import enqueue_status_update, get_message_queue
+from .message_queue import (
+    enqueue_interactive_ui,
+    enqueue_status_update,
+    get_message_queue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +57,21 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 # the topic is gone either way, and all the cleanup does is kill the tab and
 # unbind the thread.
 TOPIC_CHECK_INTERVAL = 300.0  # seconds
+
+# How long polling waits for the transcript to claim a UI it can also see.
+#
+# AskUserQuestion and ExitPlanMode reach us twice: as a pane render and as a
+# JSONL tool_use. Only the JSONL path is correctly ordered — it sits in the
+# same stream as the assistant text Claude wrote before asking, so the queue
+# keeps the two in sequence. The pane, meanwhile, shows the picker a second
+# or so before that text is flushed to the transcript, so rendering on sight
+# always buries the reasoning below the question. Polling therefore defers
+# to the transcript for these, and only steps in if it never arrives (hook
+# missing, monitor stalled).
+TRANSCRIPT_UI_GRACE = 5.0  # seconds
+
+# (user_id, thread_id_or_0) -> monotonic time a deferred UI was first seen
+_pending_ui_since: dict[tuple[int, int], float] = {}
 
 
 async def update_status_message(
@@ -97,17 +121,43 @@ async def update_status_message(
         # Clear stale interactive mode
         await clear_interactive_msg(user_id, bot, thread_id)
 
+    pkey = (user_id, thread_id or 0)
+
     # Check for permission prompt (interactive UI not triggered via JSONL)
     # ALWAYS check UI, regardless of skip_status
     if should_check_new_ui and is_interactive_ui(pane_text):
+        content = extract_interactive_content(pane_text)
+        if content and content.name in INTERACTIVE_TOOL_NAMES:
+            # This one also arrives via the transcript, in the right order.
+            # Hold off until the grace period expires.
+            first_seen = _pending_ui_since.setdefault(pkey, time.monotonic())
+            if time.monotonic() - first_seen < TRANSCRIPT_UI_GRACE:
+                return
+            logger.info(
+                "Transcript never delivered %s for window %s — rendering from "
+                "the pane after %.0fs",
+                content.name,
+                window_id,
+                TRANSCRIPT_UI_GRACE,
+            )
+        _pending_ui_since.pop(pkey, None)
         logger.debug(
             "Interactive UI detected in polling (user=%d, window=%s, thread=%s)",
             user_id,
             window_id,
             thread_id,
         )
-        await handle_interactive_ui(bot, user_id, window_id, thread_id)
+        # Claim interactive mode now so the next poll cycle (and the JSONL
+        # tool_use arriving moments later) don't queue a second render, then
+        # let the picker travel through the message queue — sending it
+        # directly would jump the queue and land above the content Claude
+        # produced before the prompt.
+        set_interactive_mode(user_id, window_id, thread_id)
+        await enqueue_interactive_ui(bot, user_id, window_id, thread_id=thread_id)
         return
+
+    # No UI on screen — a later question must start its own grace period.
+    _pending_ui_since.pop(pkey, None)
 
     # Normal status line check — skip if queue is non-empty
     if skip_status:

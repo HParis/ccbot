@@ -11,6 +11,10 @@ Per-**topic** message queues + worker pattern for all send tasks, keyed `(user_i
 
 Flood control (`_flood_until`) stays keyed by user: a 429 throttles the whole supergroup, so every topic's worker backs off together.
 
+**Interactive pickers ride the queue too**: AskUserQuestion / ExitPlanMode / permission prompts are enqueued as `interactive_ui` tasks rather than sent inline, so a picker can never overtake the assistant text Claude wrote before asking. Both detectors (JSONL `tool_use` and status polling) claim interactive mode before enqueuing, and `handle_interactive_ui` is serialized per `(user, thread)` by a lock — the second caller edits the first one's message instead of sending a duplicate. If the picker is gone from the pane by the time the task runs, the queued fallback `tool_use` text is sent instead.
+
+For UIs that also reach us through the transcript (`AskUserQuestion`, `ExitPlanMode`), the JSONL path is the *only* correctly ordered one: the pane renders the picker a second or so before Claude Code flushes the preceding assistant text to the JSONL, so rendering on sight buries the reasoning below the question. Status polling defers those for `TRANSCRIPT_UI_GRACE` (5s) and only renders them itself if the transcript never delivers. Permission prompts, `/model`, and other pane-only UIs are still rendered on sight.
+
 **Message merging**: The worker automatically merges consecutive mergeable content messages on dequeue:
 - Content messages for the same window can be merged (including text, thinking)
 - tool_use breaks the merge chain and is sent separately (message ID recorded for later editing)

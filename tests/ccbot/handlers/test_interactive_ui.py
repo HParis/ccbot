@@ -229,3 +229,60 @@ class TestKeyboardLayoutForSettings:
         assert any(CB_ASK_RIGHT in d for d in all_cb_data if d)
         assert any(CB_ASK_ESC in d for d in all_cb_data if d)
         assert any(CB_ASK_ENTER in d for d in all_cb_data if d)
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestConcurrentSends:
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_send_only_one_message(
+        self, sample_pane_settings: str
+    ):
+        """Two callers racing to show the same picker must produce ONE message.
+
+        Regression: status polling detects the UI in the pane at the same
+        moment the JSONL tool_use arrives. The message id is only recorded
+        *after* the (rate-limited, multi-second) send returns, so both
+        callers saw an empty slot and each sent its own copy — the loser's
+        id was then orphaned and never edited or deleted again.
+        """
+        import asyncio
+
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        bot = AsyncMock()
+        sent_msg = MagicMock()
+        sent_msg.message_id = 999
+
+        async def slow_send(*_args, **_kwargs):
+            await asyncio.sleep(0.05)  # rate limiter delaying the send
+            return sent_msg
+
+        bot.send_message = AsyncMock(side_effect=slow_send)
+        bot.edit_message_text = AsyncMock()
+
+        with (
+            patch("ccbot.handlers.interactive_ui.terminal_manager") as mock_iterm,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+        ):
+            mock_iterm.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_iterm.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            results = await asyncio.gather(
+                handle_interactive_ui(
+                    bot, user_id=1, window_id=window_id, thread_id=42
+                ),
+                handle_interactive_ui(
+                    bot, user_id=1, window_id=window_id, thread_id=42
+                ),
+            )
+
+        assert results == [True, True]
+        bot.send_message.assert_called_once()
+        # The second caller edited the message the first one registered.
+        bot.edit_message_text.assert_called_once()
+        assert _interactive_msgs.get((1, 42)) == 999

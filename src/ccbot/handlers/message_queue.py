@@ -44,6 +44,7 @@ from ..terminal_parser import parse_status_line
 from ..terminal.manager import terminal_manager
 from ..rich_message import contains_rich_blocks
 from ..transcript_parser import TranscriptParser
+from .interactive_ui import clear_interactive_mode, handle_interactive_ui
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
@@ -69,7 +70,7 @@ MERGE_MAX_LENGTH = 7400  # Under the 8000 split limit; room for MarkdownV2 escap
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear"]
+    task_type: Literal["content", "status_update", "status_clear", "interactive_ui"]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -184,7 +185,7 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
     if base.window_id != candidate.window_id:
         return False
-    if candidate.task_type != "content":
+    if base.task_type != "content" or candidate.task_type != "content":
         return False
     # tool_use/tool_result break merge chain
     # - tool_use: will be edited later by tool_result
@@ -365,6 +366,8 @@ async def _message_queue_worker(
                     await _process_content_with_retry(bot, user_id, merged_task)
                 elif task.task_type == "status_update":
                     await _process_status_update_task(bot, user_id, task)
+                elif task.task_type == "interactive_ui":
+                    await _process_interactive_ui_task(bot, user_id, task)
                 elif task.task_type == "status_clear":
                     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
             except RetryAfter as e:
@@ -787,6 +790,76 @@ async def _check_and_send_status(
     status_line = parse_status_line(pane_text)
     if status_line:
         await _do_send_status_message(bot, user_id, tid, window_id, status_line)
+
+
+async def _process_interactive_ui_task(
+    bot: Bot, user_id: int, task: MessageTask
+) -> None:
+    """Render the interactive picker in queue order.
+
+    The picker goes through the queue rather than straight to Telegram so it
+    can never overtake the assistant text Claude wrote before asking. If the
+    pane no longer shows the picker by the time we get here (the user already
+    answered in the terminal, or it never rendered), fall back to the plain
+    tool_use message the caller supplied — dropping it silently would lose
+    the tool call from the topic entirely.
+    """
+    handled = await handle_interactive_ui(
+        bot, user_id, task.window_id or "", task.thread_id
+    )
+    if handled:
+        return
+
+    clear_interactive_mode(user_id, task.thread_id)
+    if task.parts:
+        await _process_content_with_retry(
+            bot,
+            user_id,
+            MessageTask(
+                task_type="content",
+                text=task.text,
+                window_id=task.window_id,
+                parts=task.parts,
+                tool_use_id=task.tool_use_id,
+                content_type=task.content_type,
+                thread_id=task.thread_id,
+            ),
+        )
+
+
+async def enqueue_interactive_ui(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None = None,
+    parts: list[str] | None = None,
+    tool_use_id: str | None = None,
+    content_type: str = "tool_use",
+    text: str | None = None,
+) -> None:
+    """Enqueue an interactive-picker render, ordered with content messages.
+
+    ``parts`` is the fallback message to send if the picker is no longer on
+    screen when the task runs; the polling path passes none.
+    """
+    logger.debug(
+        "Enqueue interactive UI: user=%d, window_id=%s, thread=%s",
+        user_id,
+        window_id,
+        thread_id,
+    )
+    queue = get_or_create_queue(bot, user_id, thread_id)
+    queue.put_nowait(
+        MessageTask(
+            task_type="interactive_ui",
+            text=text,
+            window_id=window_id,
+            parts=parts or [],
+            tool_use_id=tool_use_id,
+            content_type=content_type,
+            thread_id=thread_id,
+        )
+    )
 
 
 async def enqueue_content_message(

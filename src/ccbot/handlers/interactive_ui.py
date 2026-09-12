@@ -14,11 +14,13 @@ Provides:
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
+import asyncio
 import logging
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
+from .. import telemetry
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
 from ..terminal.manager import terminal_manager
@@ -45,6 +47,26 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
+
+# Serialize picker renders per (user_id, thread_id_or_0).
+#
+# Two independent detectors race to show the same picker: status polling
+# sees it in the pane, and the JSONL tool_use arrives moments later. The
+# message id is only recorded *after* the send returns, and that send can
+# sit in the rate limiter for seconds — long enough for the other caller
+# to read an empty slot and send its own copy. The duplicate is permanent:
+# whichever send finishes last owns the tracking slot, so the other message
+# is never edited or deleted again.
+_ui_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def _get_ui_lock(ikey: tuple[int, int]) -> asyncio.Lock:
+    """Get (or create) the render lock for a (user, thread) picker slot."""
+    lock = _ui_locks.get(ikey)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ui_locks[ikey] = lock
+    return lock
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -152,8 +174,24 @@ async def handle_interactive_ui(
     Handles AskUserQuestion, ExitPlanMode, Permission Prompt, and
     RestoreCheckpoint UIs. Returns True if UI was detected and sent,
     False otherwise.
+
+    Serialized per (user, thread): concurrent callers queue up behind the
+    lock, so the second one sees the first one's message id and edits it
+    instead of sending a duplicate.
     """
     ikey = (user_id, thread_id or 0)
+    async with _get_ui_lock(ikey):
+        return await _render_interactive_ui(bot, user_id, window_id, ikey)
+
+
+async def _render_interactive_ui(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    ikey: tuple[int, int],
+) -> bool:
+    """Capture the pane and send/edit the picker. Caller holds the UI lock."""
+    thread_id: int | None = ikey[1] or None
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     w = await terminal_manager.find_window_by_id(window_id)
     if not w:
@@ -193,6 +231,7 @@ async def handle_interactive_ui(
     # Check if we have an existing interactive message to edit
     existing_msg_id = _interactive_msgs.get(ikey)
     if existing_msg_id:
+        telemetry.count("picker:edit")
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
@@ -231,6 +270,7 @@ async def handle_interactive_ui(
     logger.info(
         "Sending interactive UI to user %d for window_id %s", user_id, window_id
     )
+    telemetry.count("picker:send")
     try:
         sent = await bot.send_message(
             chat_id=chat_id,
