@@ -4,12 +4,16 @@ Provides UIs in Telegram for:
   - Window picker: list unbound iTerm2 sessions (incl. user-opened
     tabs that aren't yet ccbot-tagged) for quick adoption.
   - Directory browser: navigate directory hierarchies to create new sessions
+  - Workspace picker: for backends that cannot host a session in an arbitrary
+    directory (``Capabilities.arbitrary_cwd=False``), pick one of the
+    projects the backend already knows instead of browsing the filesystem
 
 Key components:
   - DIRS_PER_PAGE / WINDOWS_PER_PAGE: pagination sizes
   - User state keys for tracking browse/picker session
   - build_window_picker: Build candidate-session picker UI
   - build_directory_browser: Build directory browser UI
+  - build_workspace_picker: Build workspace picker UI (arbitrary_cwd=False)
   - clear_window_picker_state: Clear picker state from user_data
   - clear_browse_state: Clear browsing state from user_data
 """
@@ -23,6 +27,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from ..session import ClaudeSession
 
 from ..config import config
+from ..terminal.base import Workspace
+from ..terminal.manager import terminal_manager
 from .callback_data import (
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
@@ -36,6 +42,9 @@ from .callback_data import (
     CB_WIN_CANCEL,
     CB_WIN_NEW,
     CB_WIN_PAGE,
+    CB_WS_CANCEL,
+    CB_WS_PAGE,
+    CB_WS_SELECT,
 )
 
 # Directories per page in directory browser
@@ -55,6 +64,9 @@ UNBOUND_WINDOWS_FULL_KEY = (
     "unbound_windows_full"  # Full list of (wid, name, cwd, has_claude)
 )
 WINDOW_PAGE_KEY = "window_page"  # Current page in window picker
+STATE_SELECTING_WORKSPACE = "selecting_workspace"
+WORKSPACES_KEY = "workspaces"  # Cache of Workspace path list (paginated)
+WORKSPACE_PAGE_KEY = "workspace_page"
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
 
@@ -75,6 +87,14 @@ def clear_window_picker_state(user_data: dict | None) -> None:
         user_data.pop(UNBOUND_WINDOWS_KEY, None)
         user_data.pop(UNBOUND_WINDOWS_FULL_KEY, None)
         user_data.pop(WINDOW_PAGE_KEY, None)
+
+
+def clear_workspace_picker_state(user_data: dict | None) -> None:
+    """Clear workspace picker state keys from user_data."""
+    if user_data is not None:
+        user_data.pop(STATE_KEY, None)
+        user_data.pop(WORKSPACES_KEY, None)
+        user_data.pop(WORKSPACE_PAGE_KEY, None)
 
 
 def clear_session_picker_state(user_data: dict | None) -> None:
@@ -179,13 +199,14 @@ def build_window_picker(
             )
         buttons.append(nav)
 
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "📁 Browse directories instead", callback_data=CB_WIN_NEW
-            ),
-        ]
+    # Label the escape hatch for what it actually opens: a backend that only
+    # hosts sessions in registered projects has no filesystem to browse.
+    new_label = (
+        "📁 Browse directories instead"
+        if terminal_manager.capabilities.arbitrary_cwd
+        else "📦 Pick a project instead"
     )
+    buttons.append([InlineKeyboardButton(new_label, callback_data=CB_WIN_NEW)])
     buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL)])
 
     text = "\n".join(lines)
@@ -264,6 +285,75 @@ def build_directory_browser(
         text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\nTap a folder to enter, or select current directory"
 
     return text, InlineKeyboardMarkup(buttons), subdirs
+
+
+WORKSPACES_PER_PAGE = 6
+
+
+def build_workspace_picker(
+    workspaces: list[Workspace], page: int = 0
+) -> tuple[str, InlineKeyboardMarkup, list[str]]:
+    """Build the workspace picker UI.
+
+    Shown instead of the directory browser when the backend declares
+    ``arbitrary_cwd=False``: there is no point letting the user walk the
+    filesystem when the backend will only open a session inside a project it
+    already knows, and rejecting the choice afterwards is a worse experience
+    than not offering it.
+
+    Returns: (text, keyboard, paths) where paths is the full ordered list for
+    caching — the callback carries an index, not a path, to stay inside
+    Telegram's 64-byte callback_data limit.
+    """
+    paths = [w.path for w in workspaces]
+    total_pages = max(
+        1, (len(workspaces) + WORKSPACES_PER_PAGE - 1) // WORKSPACES_PER_PAGE
+    )
+    page = max(0, min(page, total_pages - 1))
+    start = page * WORKSPACES_PER_PAGE
+    page_items = workspaces[start : start + WORKSPACES_PER_PAGE]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for offset, ws in enumerate(page_items):
+        label = ws.label or Path(ws.path).name or ws.path
+        if ws.detail:
+            label = f"{label} · {ws.detail}"
+        if len(label) > 34:
+            label = label[:33] + "…"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"📦 {label}", callback_data=f"{CB_WS_SELECT}{start + offset}"
+                )
+            ]
+        )
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("◀", callback_data=f"{CB_WS_PAGE}{page - 1}")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+        )
+        if page < total_pages - 1:
+            nav.append(
+                InlineKeyboardButton("▶", callback_data=f"{CB_WS_PAGE}{page + 1}")
+            )
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_WS_CANCEL)])
+
+    if workspaces:
+        text = "*Select a Project*\n\nSessions run inside a project the terminal already knows."
+    else:
+        text = (
+            "*No projects available*\n\n"
+            "This terminal hosts sessions inside registered projects only. "
+            "Add the project in the terminal app first, then send a message here again."
+        )
+    return text, InlineKeyboardMarkup(buttons), paths
 
 
 def _relative_time(file_path: str) -> str:

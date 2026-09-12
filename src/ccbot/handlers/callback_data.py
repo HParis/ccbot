@@ -6,6 +6,8 @@ Each prefix identifies a specific action or navigation target.
 Constants:
   - CB_HISTORY_*: History pagination
   - CB_DIR_*: Directory browser navigation
+  - CB_WS_*: Workspace picker (backends that host sessions in registered
+    projects only — see Capabilities.arbitrary_cwd)
   - CB_WIN_*: Window picker (bind existing unbound window)
   - CB_SCREENSHOT_*: Screenshot refresh
   - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
@@ -22,6 +24,13 @@ CB_DIR_UP = "db:up"
 CB_DIR_CONFIRM = "db:confirm"
 CB_DIR_CANCEL = "db:cancel"
 CB_DIR_PAGE = "db:page:"
+
+# Workspace picker — shown instead of the directory browser when the backend
+# declares arbitrary_cwd=False (Orca: a terminal belongs to a worktree, so
+# there is nothing to browse; the user picks a registered project).
+CB_WS_SELECT = "ws:sel:"  # ws:sel:<index>
+CB_WS_PAGE = "ws:page:"  # ws:page:<page_index>
+CB_WS_CANCEL = "ws:cancel"
 
 # Window picker (bind existing unbound window)
 CB_WIN_BIND = "wb:sel:"  # wb:sel:<index>

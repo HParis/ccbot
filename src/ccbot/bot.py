@@ -86,6 +86,9 @@ from .handlers.callback_data import (
     CB_WIN_CANCEL,
     CB_WIN_NEW,
     CB_WIN_PAGE,
+    CB_WS_CANCEL,
+    CB_WS_PAGE,
+    CB_WS_SELECT,
 )
 from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
@@ -96,15 +99,20 @@ from .handlers.directory_browser import (
     STATE_KEY,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
+    STATE_SELECTING_WORKSPACE,
     UNBOUND_WINDOWS_FULL_KEY,
     UNBOUND_WINDOWS_KEY,
     WINDOW_PAGE_KEY,
+    WORKSPACE_PAGE_KEY,
+    WORKSPACES_KEY,
     build_directory_browser,
+    build_workspace_picker,
     build_session_picker,
     build_window_picker,
     clear_browse_state,
     clear_session_picker_state,
     clear_window_picker_state,
+    clear_workspace_picker_state,
     picker_label,
 )
 from .handlers.cleanup import clear_topic_state
@@ -957,19 +965,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await safe_reply(update.message, msg_text, reply_markup=keyboard)
             return
 
-        # No unbound windows — show directory browser to create a new session
+        # No unbound windows — ask where the new session should run
         logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d)",
+            "Unbound topic: asking for a session location (user=%d, thread=%d)",
             user.id,
             thread_id,
         )
-        start_path = str(Path.cwd())
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        msg_text, keyboard = await _build_session_location_picker(context)
         if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
             context.user_data["_pending_thread_id"] = thread_id
             context.user_data["_pending_thread_text"] = text
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
@@ -1079,6 +1082,64 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --- Window creation helper ---
+
+
+async def _build_session_location_picker(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Render the picker that asks where a new session should run.
+
+    Two shapes, chosen by capability rather than by backend name: a backend
+    that can host a session in any directory gets the filesystem browser; one
+    that cannot (Orca, whose terminals belong to registered worktrees) gets
+    the list of places it will actually accept, so the user cannot pick a
+    path that is refused after the fact.
+    """
+    if terminal_manager.capabilities.arbitrary_cwd:
+        start_path = str(Path.cwd())
+        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            context.user_data[BROWSE_PATH_KEY] = start_path
+            context.user_data[BROWSE_PAGE_KEY] = 0
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        return msg_text, keyboard
+
+    workspaces = await terminal_manager.list_workspaces()
+    msg_text, keyboard, paths = build_workspace_picker(workspaces)
+    if context.user_data is not None:
+        context.user_data[STATE_KEY] = STATE_SELECTING_WORKSPACE
+        context.user_data[WORKSPACES_KEY] = paths
+        context.user_data[WORKSPACE_PAGE_KEY] = 0
+    return msg_text, keyboard
+
+
+async def _proceed_with_directory(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: Any,
+    selected_path: str,
+    pending_thread_id: int | None,
+) -> None:
+    """Resume-or-create for a chosen directory.
+
+    Shared by the directory browser's Select button and the workspace
+    picker, which differ only in how the user arrives at a path.
+    """
+    sessions = await session_manager.list_sessions_for_directory(selected_path)
+    if sessions:
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+            context.user_data[SESSIONS_KEY] = sessions
+            context.user_data["_selected_path"] = selected_path
+        text, keyboard = build_session_picker(sessions)
+        await safe_edit(query, text, reply_markup=keyboard)
+        await query.answer()
+        return
+
+    await _create_and_bind_window(
+        query, context, user, selected_path, pending_thread_id
+    )
 
 
 async def _create_and_bind_window(
@@ -1455,22 +1516,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         clear_browse_state(context.user_data)
-
-        # Check for existing sessions in this directory
-        sessions = await session_manager.list_sessions_for_directory(selected_path)
-        if sessions:
-            # Show session picker — store state for later
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
-                context.user_data[SESSIONS_KEY] = sessions
-                context.user_data["_selected_path"] = selected_path
-            text, keyboard = build_session_picker(sessions)
-            await safe_edit(query, text, reply_markup=keyboard)
-            await query.answer()
-            return
-
-        # No existing sessions — create new window directly
-        await _create_and_bind_window(
+        await _proceed_with_directory(
             query, context, user, selected_path, pending_thread_id
         )
 
@@ -1482,6 +1528,71 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         clear_browse_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data.pop("_pending_thread_id", None)
+            context.user_data.pop("_pending_thread_text", None)
+        await safe_edit(query, "Cancelled")
+        await query.answer("Cancelled")
+
+    # Workspace picker (backends that host sessions in projects only)
+    elif data.startswith(CB_WS_SELECT):
+        pending_thread_id = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if (
+            pending_thread_id is not None
+            and _get_thread_id(update) != pending_thread_id
+        ):
+            clear_workspace_picker_state(context.user_data)
+            if context.user_data is not None:
+                context.user_data.pop("_pending_thread_id", None)
+                context.user_data.pop("_pending_thread_text", None)
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+
+        paths: list[str] = (
+            context.user_data.get(WORKSPACES_KEY, []) if context.user_data else []
+        )
+        try:
+            idx = int(data[len(CB_WS_SELECT) :])
+        except ValueError:
+            await query.answer("Invalid selection", show_alert=True)
+            return
+        if not 0 <= idx < len(paths):
+            # The cache is gone (restart) or the project list moved under us.
+            await query.answer("Stale picker — send a message again", show_alert=True)
+            return
+
+        selected_path = paths[idx]
+        clear_workspace_picker_state(context.user_data)
+        await _proceed_with_directory(
+            query, context, user, selected_path, pending_thread_id
+        )
+
+    elif data.startswith(CB_WS_PAGE):
+        try:
+            pg = int(data[len(CB_WS_PAGE) :])
+        except ValueError:
+            await query.answer("Invalid page", show_alert=True)
+            return
+        # Re-read rather than paginate a cache: the project list is the
+        # backend's, and it may have changed since the picker was drawn.
+        workspaces = await terminal_manager.list_workspaces()
+        msg_text, keyboard, ws_paths = build_workspace_picker(workspaces, pg)
+        if context.user_data is not None:
+            context.user_data[WORKSPACES_KEY] = ws_paths
+            context.user_data[WORKSPACE_PAGE_KEY] = pg
+        await safe_edit(query, msg_text, reply_markup=keyboard)
+        await query.answer()
+
+    elif data == CB_WS_CANCEL:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        clear_workspace_picker_state(context.user_data)
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
@@ -1712,13 +1823,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         # Preserve pending thread info, clear only picker state
         clear_window_picker_state(context.user_data)
-        start_path = str(Path.cwd())
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        msg_text, keyboard = await _build_session_location_picker(context)
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
