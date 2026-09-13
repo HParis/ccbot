@@ -1015,6 +1015,7 @@ class SessionManager:
                 self.bind_thread(
                     uid, tid, sess.window_id, window_name=name, cwd=target_cwd
                 )
+                await self._claim_session_if_unmapped(sess.window_id, target_cwd)
                 claimed.add(sess.window_id)
                 bound.add(sess.window_id)
                 count += 1
@@ -1028,6 +1029,68 @@ class SessionManager:
                     via,
                 )
         return count
+
+    async def _claim_session_if_unmapped(self, window_id: str, cwd: str) -> None:
+        """Give a freshly rebound session a session_map entry if it has none.
+
+        Rebinding restores the outbound half only. Inbound — Claude's output
+        reaching Telegram — needs session_map to say which Claude session the
+        window hosts, and that entry is written by the SessionStart hook,
+        which fired (if at all) long before this binding existed. It is
+        missing exactly when it matters most: after a backend switch, where
+        every key carries the previous backend's prefix, the topics rebind
+        and then sit silent.
+
+        ``claim_running_claude`` already knows how to recover the session id
+        from the transcript by cwd; this just points it at the gap.
+
+        Skipped when the window already has an entry (the hook got there
+        first), and when the discovered session is already mapped to another
+        window — two windows claiming one session would deliver its output to
+        two topics.
+        """
+        by_window = self._load_session_map_by_window()
+        if by_window.get(window_id):
+            return
+
+        session_id = await self.claim_running_claude(window_id, cwd)
+        if not session_id:
+            logger.info(
+                "Rebound %s has no session_map entry and no transcript to "
+                "claim; it will stay send-only until Claude starts there",
+                window_id,
+            )
+            return
+
+        others = [w for w, sid in by_window.items() if sid == session_id]
+        if others:
+            # Undo: the transcript we found belongs to a session another
+            # window is already delivering.
+            self._drop_session_map_entry(window_id)
+            logger.warning(
+                "Not claiming session %s for %s: already mapped to %s",
+                session_id,
+                window_id,
+                others[0],
+            )
+
+    def _drop_session_map_entry(self, window_id: str) -> None:
+        """Remove one window's session_map entry, under the hook's lock."""
+        import fcntl
+
+        map_file = config.session_map_file
+        lock_path = map_file.with_suffix(".lock")
+        try:
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    data = json.loads(map_file.read_text())
+                    if data.pop(f"{_SESSION_MAP_PREFIX}{window_id}", None) is not None:
+                        atomic_write_json(map_file, data)
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Failed to drop session_map entry for %s: %s", window_id, e)
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:
         """Look up the window_id bound to a thread."""

@@ -1093,3 +1093,137 @@ class TestRebindUsesHookCwd:
         ):
             n = await mgr.rebind_unresolved()
         assert n == 1
+
+
+class TestRebindClaimsTheRunningSession:
+    """Rebinding restores sending only. Without a session_map entry the
+    monitor has no session to watch, so Claude's output never reaches the
+    topic — the state a backend switch leaves every topic in, since every
+    existing key carries the previous backend's prefix.
+    """
+
+    @staticmethod
+    def _sess(wid, cwd):
+        from ccbot.iterm2_manager import ITermWindow
+
+        return ITermWindow(wid, "Dev", cwd, "claude", job_title="claude")
+
+    @staticmethod
+    def _map_file(monkeypatch, tmp_path, entries: dict[str, str]):
+        import json
+
+        from ccbot import session as session_mod
+
+        f = tmp_path / "session_map.json"
+        f.write_text(
+            json.dumps(
+                {
+                    f"iterm:{k}": {"session_id": v, "cwd": "/p/dev"}
+                    for k, v in entries.items()
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "session_map_file", f)
+        return f
+
+    async def test_claims_the_session_for_a_rebound_window(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        self._map_file(monkeypatch, tmp_path, {})
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        claim = AsyncMock(return_value="sess-1")
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[self._sess("NEW", "/p/dev")]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(mgr, "claim_running_claude", claim),
+        ):
+            assert await mgr.rebind_unresolved() == 1
+        claim.assert_awaited_once_with("NEW", "/p/dev")
+
+    async def test_does_not_claim_when_the_hook_already_wrote_one(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        self._map_file(monkeypatch, tmp_path, {"NEW": "sess-existing"})
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        claim = AsyncMock(return_value="sess-1")
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[self._sess("NEW", "/p/dev")]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(mgr, "claim_running_claude", claim),
+        ):
+            assert await mgr.rebind_unresolved() == 1
+        claim.assert_not_awaited()
+
+    async def test_refuses_a_session_another_window_already_owns(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """Two windows mapped to one session would deliver its output to two
+        topics, so a duplicate claim is rolled back."""
+        import json
+        from unittest.mock import AsyncMock, patch
+
+        f = self._map_file(monkeypatch, tmp_path, {"OLD": "sess-shared"})
+
+        async def fake_claim(window_id, cwd):
+            # Mimic the real method: it writes the entry before returning.
+            data = json.loads(f.read_text())
+            data[f"iterm:{window_id}"] = {"session_id": "sess-shared", "cwd": cwd}
+            f.write_text(json.dumps(data))
+            return "sess-shared"
+
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[self._sess("NEW", "/p/dev")]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(mgr, "claim_running_claude", fake_claim),
+        ):
+            await mgr.rebind_unresolved()
+
+        written = json.loads(f.read_text())
+        assert "iterm:NEW" not in written  # rolled back
+        assert written["iterm:OLD"]["session_id"] == "sess-shared"
+
+    async def test_binding_survives_a_failed_claim(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """No transcript to claim (Claude not started yet) must not undo the
+        rebind: the topic is still usable for sending."""
+        from unittest.mock import AsyncMock, patch
+
+        self._map_file(monkeypatch, tmp_path, {})
+        mgr.thread_targets = {100: {42: "/p/dev"}}
+        with (
+            patch(
+                "ccbot.session.terminal_manager.list_all_sessions",
+                AsyncMock(return_value=[self._sess("NEW", "/p/dev")]),
+            ),
+            patch(
+                "ccbot.session.terminal_manager.bind_existing_session",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(mgr, "claim_running_claude", AsyncMock(return_value=None)),
+        ):
+            assert await mgr.rebind_unresolved() == 1
+        assert mgr.get_window_for_thread(100, 42) == "NEW"
