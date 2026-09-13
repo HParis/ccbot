@@ -24,6 +24,7 @@ import asyncio
 import functools
 import logging
 import re
+import shlex
 import tempfile
 from asyncio import sleep as _sleep
 from collections.abc import Awaitable, Callable
@@ -849,6 +850,21 @@ class ITerm2Manager:
         return app.get_session_by_id(window_id)
 
     @_bounded(fallback=None)
+    async def start_claude(
+        self, window_id: str, resume_session_id: str | None = None
+    ) -> bool:
+        """Type the launch command; no session key needed.
+
+        iTerm2 injects ``ITERM_SESSION_ID`` into every shell, so the hook can
+        identify the session on its own.
+        """
+        from .config import config
+
+        cmd = config.claude_command
+        if resume_session_id:
+            cmd = f"{cmd} --resume {shlex.quote(resume_session_id)}"
+        return await self.send_keys(window_id, cmd, enter=True, literal=True)
+
     async def screenshot_session(self, window_id: str) -> bytes | None:
         """Capture a real pixel screenshot of the ccbot session's tab.
 

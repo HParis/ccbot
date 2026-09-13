@@ -407,6 +407,21 @@ class OrcaManager:
             logger.error("Orca send_keys to %s failed: %s", window_id, e)
             return False
 
+    async def start_claude(
+        self, window_id: str, resume_session_id: str | None = None
+    ) -> bool:
+        """Type the launch command with the session key in front.
+
+        Orca has no per-terminal env id, so this prefix is the only way the
+        SessionStart hook can report which terminal it is running in.
+        """
+        return await self.send_keys(
+            window_id,
+            self._launch_command(window_id, resume_session_id),
+            enter=True,
+            literal=True,
+        )
+
     async def screenshot_session(self, window_id: str) -> bytes | None:
         # Orca exposes no pixel capture; upper layers render captured text to
         # a PNG instead (monochrome — see capabilities.ansi_capture).
@@ -439,7 +454,6 @@ class OrcaManager:
         start_claude: bool = True,
         resume_session_id: str | None = None,
     ) -> tuple[bool, str, str, str]:
-        from ..config import config
 
         path = Path(work_dir).expanduser().resolve()
 
@@ -488,17 +502,23 @@ class OrcaManager:
         self._owned.add(handle)
 
         if start_claude:
-            # Inject the session_map key into Claude's env so the SessionStart
-            # hook can write ``<prefix><handle>`` — the key the bot waits on
-            # (Orca exposes no per-terminal env id like ITERM_SESSION_ID).
-            session_key = f"{self.session_map_prefix}{handle}"
-            cmd = config.claude_command
-            if resume_session_id:
-                cmd = f"{cmd} --resume {quote(resume_session_id)}"
-            launch = f"CCBOT_SESSION_KEY={quote(session_key)} {cmd}"
-            await self.send_keys(handle, launch, enter=True, literal=True)
+            await self.start_claude(handle, resume_session_id)
 
         return True, "", final_name, handle
+
+    def _launch_command(self, handle: str, resume_session_id: str | None) -> str:
+        """The command that starts Claude and lets the hook identify us.
+
+        ``CCBOT_SESSION_KEY`` carries the session_map key the bot polls for;
+        Orca exposes no per-terminal env id the hook could read instead.
+        """
+        from ..config import config
+
+        session_key = f"{self.session_map_prefix}{handle}"
+        cmd = config.claude_command
+        if resume_session_id:
+            cmd = f"{cmd} --resume {quote(resume_session_id)}"
+        return f"CCBOT_SESSION_KEY={quote(session_key)} {cmd}"
 
 
 def _short_branch(ref: str) -> str:

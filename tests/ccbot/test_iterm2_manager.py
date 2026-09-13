@@ -1507,3 +1507,29 @@ async def test_hung_rpc_falls_back_per_method(monkeypatch: Any) -> None:
     )
     assert ok is False
     assert "timed out" in msg
+
+
+class TestStartClaude:
+    """iTerm2 needs no session key: it injects ITERM_SESSION_ID into every
+    shell, so the hook identifies the session on its own."""
+
+    async def test_sends_the_bare_command(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITerm2Manager
+
+        mgr = ITerm2Manager()
+        with patch.object(mgr, "send_keys", AsyncMock(return_value=True)) as sk:
+            assert await mgr.start_claude("W") is True
+        assert sk.await_args.args[1] == "claude"
+        assert "CCBOT_SESSION_KEY" not in sk.await_args.args[1]
+
+    async def test_resume_appends_quoted_session_id(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from ccbot.iterm2_manager import ITerm2Manager
+
+        mgr = ITerm2Manager()
+        with patch.object(mgr, "send_keys", AsyncMock(return_value=True)) as sk:
+            await mgr.start_claude("W", resume_session_id="abc-123")
+        assert sk.await_args.args[1] == "claude --resume abc-123"

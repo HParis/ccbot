@@ -224,6 +224,21 @@ class TerminalBackend(Protocol):
         """Send text / named keys to a session, preserving TUI timing."""
         ...
 
+    async def start_claude(
+        self, window_id: str, resume_session_id: str | None = None
+    ) -> bool:
+        """Launch Claude Code in an existing session.
+
+        Backends differ in how the SessionStart hook learns which terminal it
+        is running in, and that knowledge belongs here rather than in the
+        caller: iTerm2 puts a per-session id in the environment of every
+        shell, while a backend without one has to prepend
+        ``CCBOT_SESSION_KEY`` to the launch command. A plain ``claude``
+        typed by an upper layer would leave the hook unable to write the key
+        the bot then waits for.
+        """
+        ...
+
     async def screenshot_session(self, window_id: str) -> bytes | None:
         """Return a PNG screenshot of the session, or None if unsupported."""
         ...

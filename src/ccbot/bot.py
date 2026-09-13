@@ -1781,7 +1781,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     has_claude = True
 
         if not has_claude:
-            await terminal_manager.send_keys(selected_wid, "claude")
+            # Backend call, not a typed "claude": a backend with no
+            # per-session env id has to prefix CCBOT_SESSION_KEY, or the
+            # hook can't write the key wait_for_session_map_entry polls for
+            # and the topic binds to a session it will never hear from.
+            await terminal_manager.start_claude(selected_wid)
             await safe_edit(
                 query,
                 f"✅ Bound to tab `{display}` — starting Claude…",

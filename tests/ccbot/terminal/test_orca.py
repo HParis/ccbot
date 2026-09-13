@@ -273,6 +273,20 @@ class TestLifecycle:
         assert launch.startswith(f"CCBOT_SESSION_KEY=orca:{HANDLE} ")
         assert handle in m._owned
 
+    async def test_start_claude_carries_the_session_key(self) -> None:
+        """Adopting an idle terminal goes through the backend so the hook can
+        still identify it — a bare `claude` typed by an upper layer would
+        leave session_map empty and the topic deaf."""
+        fake = FakeCli()
+        m = _mgr(fake)
+        assert await m.start_claude(HANDLE) is True
+        assert _text_of(fake.sends()[0]).startswith(f"CCBOT_SESSION_KEY=orca:{HANDLE} ")
+
+    async def test_start_claude_resume_quotes_the_id(self) -> None:
+        fake = FakeCli()
+        await _mgr(fake).start_claude(HANDLE, resume_session_id="abc-123")
+        assert "--resume abc-123" in _text_of(fake.sends()[0])
+
     async def test_create_window_passes_a_path_selector(self) -> None:
         fake = FakeCli()
         await _mgr(fake).create_window("/p/ccbot", start_claude=False)
