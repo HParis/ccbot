@@ -47,7 +47,7 @@ _UUID_RE = re.compile(
 )
 
 # session_map.json key prefix for the active terminal backend (e.g.
-# ``iterm:`` for iTerm2, ``otty:`` for Otty). Derived from the selected
+# ``iterm:`` for iTerm2, ``orca:`` for Orca). Derived from the selected
 # backend so the hook and the bot agree on the key. Legacy/foreign-prefix
 # entries are filtered out at read time.
 _SESSION_MAP_PREFIX = terminal_manager.session_map_prefix
@@ -158,7 +158,7 @@ class SessionManager:
         """Check if a key looks like a window ID we recognise.
 
         Accepts:
-          - the active backend's session-id shape (iTerm2 UUID, Otty
+          - the active backend's session-id shape (iTerm2 UUID, Orca
             ``p_*``, ...) — current format.
           - tmux window ID like ``@0`` / ``@12`` — legacy.  Returning
             True here lets ``resolve_stale_ids`` re-key these via

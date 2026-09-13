@@ -4,9 +4,9 @@ Adding a terminal backend is "write a file + register it":
 
     from .registry import register
 
-    @register("otty")
-    def _make_otty() -> TerminalBackend:
-        return OttyManager()
+    @register("orca")
+    def _make_orca() -> TerminalBackend:
+        return OrcaManager()
 
 The selected backend is instantiated once, on first ``get(name)``; other
 registered backends are never instantiated. Factories must be cheap and

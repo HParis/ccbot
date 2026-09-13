@@ -141,7 +141,7 @@ class TerminalBackend(Protocol):
         """Whether ``candidate`` looks like a valid session id for this backend.
 
         Used to tell live/recognized session_map keys apart from stale or
-        old-format ones during cleanup (e.g. iTerm2 = UUID, Otty = ``p_*``).
+        old-format ones during cleanup (e.g. iTerm2 = UUID, Orca = ``term_*``).
         """
         ...
 

@@ -479,7 +479,7 @@ class SessionMonitor:
         """Load current session_map and return window_id -> session_id mapping.
 
         Keys are formatted as ``<backend>:<window_id>`` (e.g. ``iterm:<UUID>``
-        or ``otty:<pane_id>``); the backend prefix is stripped so the window
+        or ``orca:<handle>``); the backend prefix is stripped so the window
         key is backend-neutral. Legacy ``ccbot:`` keys (tmux era) and any
         malformed prefix-less keys are silently ignored — they will be
         overwritten on next SessionStart hook fire.

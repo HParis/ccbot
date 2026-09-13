@@ -279,7 +279,8 @@ class TestHookMainItermKey:
 
 
 class TestHookMainCcbotKey:
-    """Checks for ccbot-injected CCBOT_SESSION_KEY (Otty and other backends)."""
+    """Checks for ccbot-injected CCBOT_SESSION_KEY (Orca and other backends
+    with no per-session env id)."""
 
     _CLAUDE_ID = "550e8400-e29b-41d4-a716-446655440000"
 
@@ -315,12 +316,21 @@ class TestHookMainCcbotKey:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
         monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
-        self._run(monkeypatch, self._payload(), ccbot_key="otty:p_19ef87d6b65_1")
+        self._run(
+            monkeypatch,
+            self._payload(),
+            ccbot_key="orca:term_b562359d-824f-4c97-b755-bc0ef914cffc",
+        )
 
         data = json.loads((tmp_path / "session_map.json").read_text())
-        assert "otty:p_19ef87d6b65_1" in data
-        assert data["otty:p_19ef87d6b65_1"]["session_id"] == self._CLAUDE_ID
-        assert data["otty:p_19ef87d6b65_1"]["cwd"] == "/tmp/proj"
+        assert "orca:term_b562359d-824f-4c97-b755-bc0ef914cffc" in data
+        assert (
+            data["orca:term_b562359d-824f-4c97-b755-bc0ef914cffc"]["session_id"]
+            == self._CLAUDE_ID
+        )
+        assert (
+            data["orca:term_b562359d-824f-4c97-b755-bc0ef914cffc"]["cwd"] == "/tmp/proj"
+        )
 
     def test_ccbot_key_takes_priority_over_iterm(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
@@ -329,11 +339,11 @@ class TestHookMainCcbotKey:
         self._run(
             monkeypatch,
             self._payload(),
-            ccbot_key="otty:p_abc_2",
+            ccbot_key="orca:term_3bd32ef3-fed3-4809-b342-662f60934e84",
             iterm_session_id="w0t1p0:9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB",
         )
         data = json.loads((tmp_path / "session_map.json").read_text())
-        assert list(data.keys()) == ["otty:p_abc_2"]
+        assert list(data.keys()) == ["orca:term_3bd32ef3-fed3-4809-b342-662f60934e84"]
 
     def test_malformed_ccbot_key_skips(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path

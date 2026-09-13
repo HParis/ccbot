@@ -43,14 +43,6 @@ import `terminal_manager` from `ccbot.terminal.manager` — never a concrete bac
 
 - **iterm2** (default): full capabilities; ownership via `user.ccbot=1`; hook
   keys on `ITERM_SESSION_ID` → `iterm:<UUID>`.
-- **otty** (`CCBOT_BACKEND=otty`): drives `otty-cli`. Requires the Otty app
-  running and `ipc-allow-send-keys = true` in `~/.config/otty/config.toml`.
-  Capabilities: no ANSI-color capture (monochrome screenshots), no native
-  ownership tag (owned panes tracked in-process + re-resolved by cwd), no
-  reconnect events. Session id = pane id (`p_*`). `create_window` opens a shell
-  tab, then sends `CCBOT_SESSION_KEY=otty:<pane_id> claude …` so the hook can
-  write the key the bot waits on (Otty has no per-pane env id).
-
 - **orca** (`CCBOT_BACKEND=orca`): drives the `orca` CLI. Requires the Orca
   app running (the backend launches it via `orca open` when needed).
   Capabilities: no ANSI-color capture, no native ownership tag, no reconnect
@@ -62,8 +54,9 @@ import `terminal_manager` from `ccbot.terminal.manager` — never a concrete bac
   browser. `capture_pane` must pass `--screen`: the default read returns
   accumulated output in which every repaint is stacked. `send_keys` maps
   named keys to raw escape sequences — `terminal send --text` is
-  byte-transparent. Like Otty, it types `CCBOT_SESSION_KEY=orca:<handle>
-  claude …` so the hook can write the key the bot waits on.
+  byte-transparent. `create_window` opens a terminal, then types
+  `CCBOT_SESSION_KEY=orca:<handle> claude …` so the hook can write the key
+  the bot waits on (Orca has no per-terminal env id).
 
 Adding a terminal = one backend file + `register("name")`. Capability flags
 drive graceful degradation; never branch on the backend name in upper layers —

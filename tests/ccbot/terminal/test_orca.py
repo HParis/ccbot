@@ -111,7 +111,7 @@ class TestContract:
     def test_session_id_shape(self) -> None:
         m = _mgr(FakeCli())
         assert m.is_session_id(HANDLE)
-        assert not m.is_session_id("p_19ef87d6b65_1")  # an Otty pane id
+        assert not m.is_session_id("term_not-a-uuid")
         assert not m.is_session_id("9F2E3A1B-DEAD-BEEF-CAFE-0123456789AB")
 
     def test_session_map_prefix(self) -> None:

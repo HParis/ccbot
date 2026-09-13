@@ -7,7 +7,7 @@ Called by Claude Code's SessionStart hook to maintain a terminal-session
 To identify which terminal session this Claude instance runs in, the hook
 resolves a session_map key (see ``_resolve_session_key``):
   - ``CCBOT_SESSION_KEY`` — injected by ccbot for backends without a
-    per-session env id (e.g. Otty); used verbatim.
+    per-session env id (e.g. Orca); used verbatim.
   - ``ITERM_SESSION_ID`` — iTerm2 injects it into every shell; keyed as
     ``iterm:<UUID>``.
 
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Validate session_id looks like a UUID
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
-# A ccbot-injected session_map key: "<backend>:<id>" (e.g. "otty:p_19ef_1").
+# A ccbot-injected session_map key: "<backend>:<id>" (e.g. "orca:term_1f2e…").
 _CCBOT_KEY_RE = re.compile(r"^[a-z0-9]+:[A-Za-z0-9._-]+$")
 
 _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
@@ -45,7 +45,7 @@ def _resolve_session_key() -> str | None:
 
     Priority:
       1. ``CCBOT_SESSION_KEY`` — injected by ccbot at launch for backends with
-         no per-session env id (Otty, ...). Already a full ``<prefix><id>``
+         no per-session env id (Orca, ...). Already a full ``<prefix><id>``
          key; written verbatim so it matches what the bot polls for.
       2. ``ITERM_SESSION_ID`` — iTerm2 injects ``wXtYpZ:UUID`` into every
          shell; key on the UUID as ``iterm:<UUID>``.
@@ -232,7 +232,7 @@ def hook_main() -> None:
         return
 
     # Resolve which terminal session hosts this hook (CCBOT_SESSION_KEY for
-    # ccbot-launched backends like Otty, else ITERM_SESSION_ID for iTerm2).
+    # ccbot-launched backends like Orca, else ITERM_SESSION_ID for iTerm2).
     # The window_name field is left empty — the bot looks up the live name
     # via its own terminal connection at read time, which is more reliable
     # than running a query from this short-lived hook subprocess.

@@ -1,6 +1,6 @@
 # CCBot
 
-Control Claude Code sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in a macOS terminal (iTerm2 by default, or Otty).
+Control Claude Code sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in a macOS terminal (iTerm2 by default, or Orca).
 
 https://github.com/user-attachments/assets/15ffb38e-5eb9-4720-93b9-412e4961dc93
 
@@ -36,15 +36,16 @@ In fact, CCBot itself was built this way — iterating on itself through Claude 
 
 ## Prerequisites
 
-- **macOS** — the supported terminal backends (iTerm2, Otty) are macOS apps
+- **macOS** — the supported terminal backends (iTerm2, Orca) are macOS apps
 - **A terminal backend** — one of:
   - **iTerm2** (default): installed, running, with the Python API enabled
     (Preferences → General → Magic → Enable Python API). Recommended: an
     iTerm2 profile named `ccbot` with its Title field set to "Session Name"
     so Claude Code's TUI cannot override the tab name. See
     `docs/migration-iterm2.md`.
-  - **Otty** (`CCBOT_BACKEND=otty`): installed and running, with
-    `ipc-allow-send-keys = true` in `~/.config/otty/config.toml`.
+  - **Orca** (`CCBOT_BACKEND=orca`): installed, with its CLI available
+    (CCBot launches the app itself when needed). Note that Orca hosts
+    sessions inside registered projects only — see below.
 - **Claude Code** — the CLI tool (`claude`) must be installed
 
 See [Terminal Backend](#terminal-backend) below for how to choose and configure one.
@@ -99,10 +100,8 @@ ALLOWED_USERS=your_telegram_user_id
 | Variable                | Default    | Description                                      |
 | ----------------------- | ---------- | ------------------------------------------------ |
 | `CCBOT_DIR`             | `~/.ccbot` | Config/state directory (`.env` loaded from here) |
-| `CCBOT_BACKEND`         | `iterm2`   | Terminal backend hosting sessions: `iterm2` or `otty` |
+| `CCBOT_BACKEND`         | `iterm2`   | Terminal backend hosting sessions: `iterm2` or `orca` |
 | `CCBOT_ITERM2_PROFILE`  | `ccbot`    | iTerm2 profile used for new tabs (iTerm2 backend) |
-| `CCBOT_OTTY_CLI`        | _(auto)_   | Path to `otty-cli` (Otty backend; auto-resolved if empty) |
-| `CCBOT_OTTY_SOCKET`     | _(none)_   | Otty IPC control socket override (Otty backend)  |
 | `CLAUDE_COMMAND`        | `claude`   | Command to run in new windows                    |
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
@@ -133,29 +132,24 @@ selected once at startup with `CCBOT_BACKEND`; the default is `iterm2`.
 3. Leave `CCBOT_BACKEND` unset (or `iterm2`). iTerm2 must stay running — quitting
    it kills every managed session.
 
-### Otty
+### Orca
 
 ```ini
-CCBOT_BACKEND=otty
+CCBOT_BACKEND=orca
 ```
 
-1. Install and run [Otty](https://docs.otty.sh/).
-2. **Enable remote key injection** (off by default) — CCBot can't send messages
-   to Claude without it:
-
-   ```bash
-   otty config set ipc-allow-send-keys true
-   otty config reload
-   ```
-
-3. CCBot auto-locates `otty-cli` (PATH or the app bundle); override with
-   `CCBOT_OTTY_CLI` if needed.
+1. Install [Orca](https://orca.computer/). CCBot locates the `orca` CLI on
+   PATH or in the app bundle, and starts the app itself when it isn't running.
 
 Differences from iTerm2 to be aware of:
 
-- **Screenshots are monochrome** — Otty's text capture carries no color.
+- **Sessions run in registered projects, not arbitrary directories** — an Orca
+  terminal belongs to a worktree, so CCBot offers a project picker instead of
+  the directory browser. A folder Orca doesn't know can't host a session; add
+  it in Orca first.
+- **Screenshots are monochrome** — Orca's screen capture carries no color.
 - **No native tab tagging** — ownership is tracked in-process and re-resolved by
-  working directory; a CCBot restart re-adopts tabs as topics are used again.
+  working directory; a CCBot restart re-adopts terminals as topics are used again.
 - **No reconnect events** — recovery is poll-based.
 
 Adding another terminal is a small effort: implement one backend in
@@ -183,7 +177,7 @@ Or manually add to `~/.claude/settings.json`:
 }
 ```
 
-This writes terminal-session-keyed mappings to `$CCBOT_DIR/session_map.json` (`~/.ccbot/` by default), so the bot automatically tracks which Claude session is running in each terminal tab — even after `/clear` or session restarts. The hook works for any backend: it keys on `ITERM_SESSION_ID` for iTerm2, or on the `CCBOT_SESSION_KEY` that CCBot injects at launch for backends like Otty.
+This writes terminal-session-keyed mappings to `$CCBOT_DIR/session_map.json` (`~/.ccbot/` by default), so the bot automatically tracks which Claude session is running in each terminal tab — even after `/clear` or session restarts. The hook works for any backend: it keys on `ITERM_SESSION_ID` for iTerm2, or on the `CCBOT_SESSION_KEY` that CCBot injects at launch for backends like Orca.
 
 ## Usage
 

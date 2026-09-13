@@ -3,7 +3,7 @@
 ccbot hosts each Claude Code session inside a GUI terminal tab and drives
 it (capture output, send keys, create/kill/rename tabs). Originally this
 was hardwired to iTerm2; this package abstracts the host terminal behind
-a single contract so other terminals (Otty, Kitty, Ghostty, ...) can be
+a single contract so other terminals (Orca, Kitty, Ghostty, ...) can be
 added by writing one backend file and registering it — no call-site
 changes.
 
